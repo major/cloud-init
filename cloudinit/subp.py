@@ -7,7 +7,9 @@ import os
 import subprocess
 from errno import ENOEXEC
 from io import TextIOWrapper
-from typing import List, Union
+from typing import List, Optional, Union
+
+from cloudinit import performance, signal_handler
 
 LOG = logging.getLogger(__name__)
 
@@ -143,22 +145,36 @@ class ProcessExecutionError(IOError):
         return text.rstrip(b"\n").replace(b"\n", b"\n" + b" " * indent_level)
 
 
+def raise_on_invalid_command(args: Union[List[str], List[bytes]]):
+    """check argument types to ensure that subp() can run the argument
+
+    Throw a user-friendly exception which explains the issue.
+
+    args: list of arguments passed to subp()
+    raises: ProcessExecutionError with information explaining the issue
+    """
+    for component in args:
+        # if already bytes, or implements encode(), then it should be safe
+        if not (isinstance(component, bytes) or hasattr(component, "encode")):
+            LOG.warning("Running invalid command: %s", args)
+            raise ProcessExecutionError(
+                cmd=args, reason=f"Running invalid command: {args}"
+            )
+
+
 def subp(
-    args,
+    args: Union[str, bytes, List[str], List[bytes]],
     *,
     data=None,
     rcs=None,
-    env=None,
     capture=True,
-    combine_capture=False,
     shell=False,
     logstring=False,
     decode="replace",
-    target=None,
     update_env=None,
-    status_cb=None,
     cwd=None,
-):
+    timeout=None,
+) -> SubpResult:
     """Run a subprocess.
 
     :param args: command to run in a list. [cmd, arg1, arg2...]
@@ -167,16 +183,9 @@ def subp(
         a list of allowed return codes.  If subprocess exits with a value not
         in this list, a ProcessExecutionError will be raised.  By default,
         data is returned as a string.  See 'decode' parameter.
-    :param env: a dictionary for the command's environment.
     :param capture:
         boolean indicating if output should be captured.  If True, then stderr
         and stdout will be returned.  If False, they will not be redirected.
-    :param combine_capture:
-        boolean indicating if stderr should be redirected to stdout. When True,
-        interleaved stderr and stdout will be returned as the first element of
-        a tuple, the second will be empty string or bytes (per decode).
-        if combine_capture is True, then output is captured independent of
-        the value of capture.
     :param shell: boolean indicating if this should be run with a shell.
     :param logstring:
         the command will be logged to DEBUG.  If it contains info that should
@@ -186,17 +195,13 @@ def subp(
         be bytes.  Other allowed values are 'strict', 'ignore', and 'replace'.
         These values are passed through to bytes().decode() as the 'errors'
         parameter.  There is no support for decoding to other than utf-8.
-    :param target:
-        not supported, kwarg present only to make function signature similar
-        to curtin's subp.
     :param update_env:
-        update the enviornment for this command with this dictionary.
+        update the environment for this command with this dictionary.
         this will not affect the current processes os.environ.
-    :param status_cb:
-        call this fuction with a single string argument before starting
-        and after finishing.
     :param cwd:
         change the working directory to cwd before executing the command.
+    :param timeout: maximum time for the subprocess to run, passed directly to
+        the timeout parameter of Popen.communicate()
 
     :return
         if not capturing, return is (None, None)
@@ -207,43 +212,21 @@ def subp(
                 entries in tuple will be bytes
     """
 
-    # not supported in cloud-init (yet), for now kept in the call signature
-    # to ease maintaining code shared between cloud-init and curtin
-    if target is not None:
-        raise ValueError("target arg not supported by cloud-init")
-
     if rcs is None:
         rcs = [0]
 
-    devnull_fp = None
-
+    env = os.environ.copy()
     if update_env:
-        if env is None:
-            env = os.environ
-        env = env.copy()
         env.update(update_env)
 
-    if target_path(target) != "/":
-        args = ["chroot", target] + list(args)
-
-    if status_cb:
-        command = " ".join(args) if isinstance(args, list) else args
-        status_cb("Begin run command: {command}\n".format(command=command))
-    if not logstring:
-        LOG.debug(
-            "Running command %s with allowed return codes %s"
-            " (shell=%s, capture=%s)",
-            args,
-            rcs,
-            shell,
-            "combine" if combine_capture else capture,
-        )
-    else:
-        LOG.debug(
-            "Running hidden command to protect sensitive "
-            "input/output logstring: %s",
-            logstring,
-        )
+    LOG.debug(
+        "Running command %s with allowed return codes %s"
+        " (shell=%s, capture=%s)",
+        logstring if logstring else args,
+        rcs,
+        shell,
+        capture,
+    )
 
     stdin: Union[TextIOWrapper, int]
     stdout = None
@@ -251,14 +234,10 @@ def subp(
     if capture:
         stdout = subprocess.PIPE
         stderr = subprocess.PIPE
-    if combine_capture:
-        stdout = subprocess.PIPE
-        stderr = subprocess.STDOUT
     if data is None:
         # using devnull assures any reads get null, rather
         # than possibly waiting on input.
-        devnull_fp = open(os.devnull)
-        stdin = devnull_fp
+        stdin = subprocess.DEVNULL
     else:
         stdin = subprocess.PIPE
         if not isinstance(data, bytes):
@@ -273,23 +252,25 @@ def subp(
     elif isinstance(args, str):
         bytes_args = args.encode("utf-8")
     else:
+        raise_on_invalid_command(args)
         bytes_args = [
             x if isinstance(x, bytes) else x.encode("utf-8") for x in args
         ]
     try:
-        sp = subprocess.Popen(
-            bytes_args,
-            stdout=stdout,
-            stderr=stderr,
-            stdin=stdin,
-            env=env,
-            shell=shell,
-            cwd=cwd,
-        )
-        (out, err) = sp.communicate(data)
+        with performance.Timed(
+            "Running {}".format(logstring if logstring else args)
+        ):
+            sp = subprocess.Popen(
+                bytes_args,
+                stdout=stdout,
+                stderr=stderr,
+                stdin=stdin,
+                env=env,
+                shell=shell,
+                cwd=cwd,
+            )
+            out, err = sp.communicate(data, timeout=timeout)
     except OSError as e:
-        if status_cb:
-            status_cb("ERROR: End run command: invalid command provided\n")
         raise ProcessExecutionError(
             cmd=args,
             reason=e,
@@ -297,16 +278,6 @@ def subp(
             stdout="-" if decode else b"-",
             stderr="-" if decode else b"-",
         ) from e
-    finally:
-        if devnull_fp:
-            devnull_fp.close()
-
-    # Just ensure blank instead of none.
-    if capture or combine_capture:
-        if not out:
-            out = b""
-        if not err:
-            err = b""
     if decode:
 
         def ldecode(data, m="utf-8"):
@@ -317,17 +288,13 @@ def subp(
 
     rc = sp.returncode
     if rc not in rcs:
-        if status_cb:
-            status_cb("ERROR: End run command: exit({code})\n".format(code=rc))
         raise ProcessExecutionError(
             stdout=out, stderr=err, exit_code=rc, cmd=args
         )
-    if status_cb:
-        status_cb("End run command: exit({code})\n".format(code=rc))
     return SubpResult(out, err)
 
 
-def target_path(target, path=None):
+def target_path(target=None, path=None):
     # return 'path' inside target, accepting target as None
     if target in (None, ""):
         target = "/"
@@ -348,7 +315,7 @@ def target_path(target, path=None):
     return os.path.join(target, path)
 
 
-def which(program, search=None, target=None):
+def which(program, search=None, target=None) -> Optional[str]:
     target = target_path(target)
 
     if os.path.sep in program and is_exe(target_path(target, program)):
@@ -401,17 +368,20 @@ def runparts(dirp, skip_no_exist=True, exe_prefix=None):
         if is_exe(exe_path):
             attempted.append(exe_path)
             try:
-                subp(prefix + [exe_path], capture=False)
+                with signal_handler.suspend_crash():
+                    subp(prefix + [exe_path], capture=False)
             except ProcessExecutionError as e:
                 LOG.debug(e)
                 failed.append(exe_name)
-        else:
+        elif os.path.isfile(exe_path):
             LOG.warning(
                 "skipping %s as its not executable "
                 "or the underlying file system is mounted without "
                 "executable permissions.",
                 exe_path,
             )
+        else:
+            LOG.debug("Not executing special file [%s]", exe_path)
 
     if failed and attempted:
         raise RuntimeError(

@@ -1,4 +1,5 @@
 # This file is part of cloud-init. See LICENSE file for license information.
+# pylint: disable=attribute-defined-outside-init
 
 """Tests related to cloudinit.stages module."""
 import json
@@ -9,12 +10,48 @@ import pytest
 
 from cloudinit import sources, stages
 from cloudinit.event import EventScope, EventType
-from cloudinit.sources import NetworkConfigSource
-from cloudinit.util import write_file
+from cloudinit.helpers import Paths
+from cloudinit.sources import DataSource, NetworkConfigSource
+from cloudinit.util import sym_link, write_file
 from tests.unittests.helpers import mock
 from tests.unittests.util import TEST_INSTANCE_ID, FakeDataSource
 
 M_PATH = "cloudinit.stages."
+
+
+class TestUpdateEventEnabled:
+    @pytest.mark.parametrize(
+        "cfg",
+        [
+            {},
+            {"updates": {}},
+            {"updates": {"when": ["boot"]}},
+            {"updates": {"when": ["hotplug"]}},
+            {"updates": {"when": ["boot", "hotplug"]}},
+        ],
+    )
+    @pytest.mark.parametrize(
+        ["enabled_file_content", "enabled"],
+        [
+            ({"scopes": ["network"]}, True),
+            ({"scopes": []}, False),
+        ],
+    )
+    @mock.patch(M_PATH + "util.read_hotplug_enabled_file")
+    def test_hotplug_added_by_file(
+        self, m_read_hotplug_enabled_file, cfg, enabled_file_content, enabled
+    ):
+        m_datasource = mock.MagicMock(spec=DataSource)
+        m_datasource.paths = mock.MagicMock(spec=Paths)
+        m_datasource.default_update_events = {}
+        m_datasource.supported_update_events = {
+            EventScope.NETWORK: [EventType.HOTPLUG]
+        }
+        m_read_hotplug_enabled_file.return_value = enabled_file_content
+        cfg = {}
+        assert enabled is stages.update_event_enabled(
+            m_datasource, cfg, EventType.HOTPLUG, EventScope.NETWORK
+        )
 
 
 class TestInit:
@@ -28,7 +65,8 @@ class TestInit:
                 "paths": {"cloud_dir": self.tmpdir, "run_dir": self.tmpdir},
             }
         }
-        tmpdir.mkdir("instance")
+        tmpdir.mkdir("instance-uuid")
+        sym_link(tmpdir.join("instance-uuid"), tmpdir.join("instance"))
         self.init.datasource = FakeDataSource(paths=self.init.paths)
         self._real_is_new_instance = self.init.is_new_instance
         self.init.is_new_instance = mock.Mock(return_value=True)
@@ -373,7 +411,7 @@ class TestInit:
         }
         self.init.datasource = FakeDataSource(network_config={"network": None})
 
-        self.init.distro.generate_fallback_config = lambda: {}
+        self.init.distro.generate_fallback_config = dict
 
         self.init._find_networking_config()
         assert "Empty network config found" in caplog.text
@@ -393,9 +431,12 @@ class TestInit:
         assert caplog.records[0].levelname == "INFO"
         assert f"network config is disabled by {disable_file}" in caplog.text
 
+    @pytest.mark.parametrize("instance_dir_present", (True, False))
     @mock.patch("cloudinit.net.get_interfaces_by_mac")
     @mock.patch("cloudinit.distros.ubuntu.Distro")
-    def test_apply_network_on_new_instance(self, m_ubuntu, m_macs):
+    def test_apply_network_on_new_instance(
+        self, m_ubuntu, m_macs, instance_dir_present
+    ):
         """Call distro apply_network_config methods on is_new_instance."""
         net_cfg = {
             "version": 1,
@@ -415,22 +456,32 @@ class TestInit:
         m_macs.return_value = {"42:42:42:42:42:42": "eth9"}
 
         self.init._find_networking_config = fake_network_config
-
+        if not instance_dir_present:
+            self.tmpdir.join("instance").remove()
+            self.tmpdir.join("instance-uuid").remove()
         self.init.apply_network_config(True)
         networking = self.init.distro.networking
         networking.apply_network_config_names.assert_called_with(net_cfg)
         self.init.distro.apply_network_config.assert_called_with(
             net_cfg, bring_up=True
         )
-        assert net_cfg == json.loads(
-            self.tmpdir.join("instance/network-config.json").read()
-        )
-        assert net_cfg == json.loads(
-            self.tmpdir.join("network-config.json").read()
-        )
-        assert os.path.islink(self.tmpdir.join("network-config.json"))
+        if instance_dir_present:
+            assert net_cfg == json.loads(
+                self.tmpdir.join("network-config.json").read()
+            )
+            assert os.path.islink(self.tmpdir.join("network-config.json"))
+        else:
+            for path in (
+                "instance/network-config.json",
+                "network-config.json",
+            ):
+                assert not self.tmpdir.join(path).exists()
 
     @mock.patch("cloudinit.distros.ubuntu.Distro")
+    @mock.patch.dict(
+        sources.DataSource.default_update_events,
+        {EventScope.NETWORK: {EventType.BOOT_NEW_INSTANCE}},
+    )
     def test_apply_network_on_same_instance_id(self, m_ubuntu, caplog):
         """Only call distro.networking.apply_network_config_names on same
         instance id."""
@@ -526,12 +577,9 @@ class TestInit:
         self, m_ubuntu, m_macs, caplog
     ):
         """Don't apply network if datasource has no BOOT event."""
-        net_cfg = self._apply_network_setup(m_macs)
+        self._apply_network_setup(m_macs)
         self.init.apply_network_config(True)
         self.init.distro.apply_network_config.assert_not_called()
-        assert net_cfg == json.loads(
-            self.tmpdir.join("network-config.json").read()
-        )
         assert (
             "No network config applied. Neither a new instance nor datasource "
             "network update allowed" in caplog.text
@@ -601,8 +649,9 @@ class TestInit_InitializeFilesystem:
             yield init
 
     @mock.patch(M_PATH + "util.ensure_file")
+    @mock.patch(f"{M_PATH}Init._read_cfg")
     def test_ensure_file_not_called_if_no_log_file_configured(
-        self, m_ensure_file, init
+        self, m_read_cfg, m_ensure_file, init
     ):
         """If no log file is configured, we should not ensure its existence."""
         init._cfg = {}

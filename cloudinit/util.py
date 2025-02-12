@@ -12,7 +12,6 @@ import binascii
 import contextlib
 import copy as obj_copy
 import email
-import functools
 import glob
 import grp
 import gzip
@@ -35,36 +34,51 @@ import subprocess
 import sys
 import time
 from base64 import b64decode
-from collections import deque, namedtuple
-from contextlib import suppress
-from errno import EACCES, ENOENT
-from functools import lru_cache, total_ordering
+from collections import deque
+from contextlib import contextmanager, suppress
+from errno import ENOENT
+from functools import lru_cache
 from pathlib import Path
+from types import ModuleType
 from typing import (
+    IO,
+    TYPE_CHECKING,
+    Any,
     Callable,
     Deque,
     Dict,
+    Generator,
     List,
     Mapping,
+    NamedTuple,
     Optional,
     Sequence,
-    TypeVar,
+    Union,
+    cast,
 )
 from urllib import parse
+
+import yaml
 
 from cloudinit import (
     features,
     importer,
     mergers,
     net,
-    safeyaml,
+    performance,
+    settings,
     subp,
     temp_utils,
     type_utils,
     url_helper,
     version,
 )
-from cloudinit.settings import CFG_BUILTIN
+from cloudinit.log.log_util import logexc
+from cloudinit.settings import CFG_BUILTIN, PER_ONCE
+
+if TYPE_CHECKING:
+    # Avoid circular import
+    from cloudinit.helpers import Paths
 
 _DNS_REDIRECT_IP = None
 LOG = logging.getLogger(__name__)
@@ -84,20 +98,18 @@ def kernel_version():
 
 
 @lru_cache()
-def get_dpkg_architecture(target=None):
+def get_dpkg_architecture():
     """Return the sanitized string output by `dpkg --print-architecture`.
 
     N.B. This function is wrapped in functools.lru_cache, so repeated calls
     won't shell out every time.
     """
-    out = subp.subp(
-        ["dpkg", "--print-architecture"], capture=True, target=target
-    )
+    out = subp.subp(["dpkg", "--print-architecture"], capture=True)
     return out.stdout.strip()
 
 
 @lru_cache()
-def lsb_release(target=None):
+def lsb_release():
     fmap = {
         "Codename": "codename",
         "Description": "description",
@@ -107,13 +119,13 @@ def lsb_release(target=None):
 
     data = {}
     try:
-        out = subp.subp(["lsb_release", "--all"], capture=True, target=target)
+        out = subp.subp(["lsb_release", "--all"], capture=True)
         for line in out.stdout.splitlines():
             fname, _, val = line.partition(":")
             if fname in fmap:
                 data[fmap[fname]] = val.strip()
         missing = [k for k in fmap.values() if k not in data]
-        if len(missing):
+        if missing:
             LOG.warning(
                 "Missing fields in lsb_release --all output: %s",
                 ",".join(missing),
@@ -126,20 +138,17 @@ def lsb_release(target=None):
     return data
 
 
-def decode_binary(blob, encoding="utf-8"):
+def decode_binary(blob: Union[str, bytes], encoding="utf-8") -> str:
     # Converts a binary type into a text type using given encoding.
-    if isinstance(blob, str):
-        return blob
-    return blob.decode(encoding)
+    return blob if isinstance(blob, str) else blob.decode(encoding=encoding)
 
 
-def encode_text(text, encoding="utf-8"):
+def encode_text(text: Union[str, bytes], encoding="utf-8") -> bytes:
     # Converts a text string into a binary type using given encoding.
-    if isinstance(text, bytes):
-        return text
-    return text.encode(encoding)
+    return text if isinstance(text, bytes) else text.encode(encoding=encoding)
 
 
+@performance.timed("Base64 decoding")
 def maybe_b64decode(data: bytes) -> bytes:
     """base64 decode data
 
@@ -179,6 +188,7 @@ class SeLinuxGuard:
     def __init__(self, path, recursive=False):
         # Late import since it might not always
         # be possible to use this
+        self.selinux: Optional[ModuleType]
         try:
             self.selinux = importer.import_module("selinux")
         except ImportError:
@@ -287,7 +297,7 @@ def rand_str(strlen=32, select_from=None):
     r = random.SystemRandom()
     if not select_from:
         select_from = string.ascii_letters + string.digits
-    return "".join([r.choice(select_from) for _x in range(0, strlen)])
+    return "".join([r.choice(select_from) for _x in range(strlen)])
 
 
 def rand_dict_key(dictionary, postfix=None):
@@ -305,17 +315,15 @@ def read_conf(fname, *, instance_data_file=None) -> Dict:
     # Avoid circular import
     from cloudinit.handlers.jinja_template import (
         JinjaLoadError,
+        JinjaSyntaxParsingException,
         NotJinjaError,
         render_jinja_payload_from_file,
     )
 
     try:
-        config_file = load_file(fname)
-    except IOError as e:
-        if e.errno == ENOENT:
-            return {}
-        else:
-            raise
+        config_file = load_text_file(fname)
+    except FileNotFoundError:
+        return {}
 
     if instance_data_file and os.path.exists(instance_data_file):
         try:
@@ -330,6 +338,12 @@ def read_conf(fname, *, instance_data_file=None) -> Dict:
                 instance_data_file,
                 fname,
             )
+        except JinjaSyntaxParsingException as e:
+            LOG.warning(
+                "Failed to render templated yaml config file '%s'. %s",
+                fname,
+                e,
+            )
         except NotJinjaError:
             # A log isn't appropriate here as we generally expect most
             # cloud.cfgs to not be templated. The other path is logged
@@ -342,8 +356,6 @@ def read_conf(fname, *, instance_data_file=None) -> Dict:
                 config_file,
                 repr(e),
             )
-    if config_file is None:
-        return {}
     return load_yaml(config_file, default={})  # pyright: ignore
 
 
@@ -388,13 +400,13 @@ def clean_filename(fn):
 
 def decomp_gzip(data, quiet=True, decode=True):
     try:
-        buf = io.BytesIO(encode_text(data))
-        with contextlib.closing(gzip.GzipFile(None, "rb", 1, buf)) as gh:
-            # E1101 is https://github.com/PyCQA/pylint/issues/1444
+        with io.BytesIO(encode_text(data)) as buf, gzip.GzipFile(
+            None, "rb", 1, buf
+        ) as gh:
             if decode:
-                return decode_binary(gh.read())  # pylint: disable=E1101
+                return decode_binary(gh.read())
             else:
-                return gh.read()  # pylint: disable=E1101
+                return gh.read()
     except Exception as e:
         if quiet:
             return data
@@ -430,58 +442,14 @@ def get_modules_from_dir(root_dir: str) -> dict:
     return entries
 
 
-def write_to_console(conpath, text):
-    with open(conpath, "w") as wfh:
-        wfh.write(text)
-        wfh.flush()
-
-
-def multi_log(
-    text,
-    console=True,
-    stderr=True,
-    log=None,
-    log_level=logging.DEBUG,
-    fallback_to_stdout=True,
-):
-    if stderr:
-        sys.stderr.write(text)
-    if console:
-        conpath = "/dev/console"
-        writing_to_console_worked = False
-        if os.path.exists(conpath):
-            try:
-                write_to_console(conpath, text)
-                writing_to_console_worked = True
-            except OSError:
-                console_error = "Failed to write to /dev/console"
-                sys.stdout.write(f"{console_error}\n")
-                if log:
-                    log.log(logging.WARNING, console_error)
-
-        if fallback_to_stdout and not writing_to_console_worked:
-            # A container may lack /dev/console (arguably a container bug).
-            # Additionally, /dev/console may not be writable to on a VM (again
-            # likely a VM bug or virtualization bug).
-            #
-            # If either of these is the case, then write output to stdout.
-            # This will result in duplicate stderr and stdout messages if
-            # stderr was True.
-            #
-            # even though systemd might have set up output to go to
-            # /dev/console, the user may have configured elsewhere via
-            # cloud-config 'output'.  If there is /dev/console, messages will
-            # still get there.
-            sys.stdout.write(text)
-    if log:
-        if text[-1] == "\n":
-            log.log(log_level, text[:-1])
-        else:
-            log.log(log_level, text)
-
-
 @lru_cache()
 def is_Linux():
+    """deprecated: prefer Distro object's `is_linux` property
+
+    Multiple sources of truth is bad, and already know whether we are
+    working with Linux from the Distro class. Using Distro offers greater code
+    reusablity, cleaner code, and easier maintenance.
+    """
     return "Linux" in platform.system()
 
 
@@ -544,7 +512,7 @@ def _parse_redhat_release(release_file=None):
         release_file = "/etc/redhat-release"
     if not os.path.exists(release_file):
         return {}
-    redhat_release = load_file(release_file)
+    redhat_release = load_text_file(release_file)
     redhat_regex = (
         r"(?P<name>.+) release (?P<version>[\d\.]+) "
         r"\((?P<codename>[^)]+)\)"
@@ -581,7 +549,7 @@ def get_linux_distro():
     os_release = {}
     os_release_rhel = False
     if os.path.exists("/etc/os-release"):
-        os_release = load_shell_content(load_file("/etc/os-release"))
+        os_release = load_shell_content(load_text_file("/etc/os-release"))
     if not os_release:
         os_release_rhel = True
         os_release = _parse_redhat_release()
@@ -617,7 +585,7 @@ def get_linux_distro():
         dist = ("", "", "")
         try:
             # Was removed in 3.8
-            dist = platform.dist()  # pylint: disable=W1505,E1101
+            dist = platform.dist()  # type: ignore  # pylint: disable=W1505,E1101
         except Exception:
             pass
         finally:
@@ -643,7 +611,9 @@ def _get_variant(info):
         if linux_dist in (
             "almalinux",
             "alpine",
+            "aosc",
             "arch",
+            "azurelinux",
             "centos",
             "cloudlinux",
             "debian",
@@ -744,7 +714,7 @@ def get_cfg_by_path(yobj, keyp, default=None):
                  or an iterable.
     @param default: The default to return if the path does not exist.
     @return: The value of the item at keyp."
-        is not found."""
+    is not found."""
 
     if isinstance(keyp, str):
         keyp = keyp.split("/")
@@ -820,7 +790,9 @@ def redirect_output(outfmt, errfmt, o_out=None, o_err=None):
                 stdin=subprocess.PIPE,
                 preexec_fn=set_subprocess_umask_and_gid,
             )
-            new_fp = proc.stdin
+            # As stdin is PIPE, then proc.stdin is IO[bytes]
+            # https://docs.python.org/3/library/subprocess.html#subprocess.Popen.stdin
+            new_fp = cast(IO[Any], proc.stdin)
         else:
             raise TypeError("Invalid type for output format: %s" % outfmt)
 
@@ -847,7 +819,9 @@ def redirect_output(outfmt, errfmt, o_out=None, o_err=None):
                 stdin=subprocess.PIPE,
                 preexec_fn=set_subprocess_umask_and_gid,
             )
-            new_fp = proc.stdin
+            # As stdin is PIPE, then proc.stdin is IO[bytes]
+            # https://docs.python.org/3/library/subprocess.html#subprocess.Popen.stdin
+            new_fp = cast(IO[Any], proc.stdin)
         else:
             raise TypeError("Invalid type for error format: %s" % errfmt)
 
@@ -941,16 +915,18 @@ def del_dir(path):
     shutil.rmtree(path)
 
 
-# read_optional_seed
-# returns boolean indicating success or failure (presense of files)
-# if files are present, populates 'fill' dictionary with 'user-data' and
-# 'meta-data' entries
 def read_optional_seed(fill, base="", ext="", timeout=5):
+    """
+    returns boolean indicating success or failure (presense of files)
+    if files are present, populates 'fill' dictionary with 'user-data' and
+    'meta-data' entries
+    """
     try:
-        (md, ud, vd) = read_seeded(base, ext, timeout)
+        md, ud, vd, network = read_seeded(base=base, ext=ext, timeout=timeout)
         fill["user-data"] = ud
         fill["vendor-data"] = vd
         fill["meta-data"] = md
+        fill["network-config"] = network
         return True
     except url_helper.UrlError as e:
         if e.code == url_helper.NOT_FOUND:
@@ -1001,7 +977,7 @@ def load_yaml(blob, default=None, allowed=(dict,)):
             len(blob),
             allowed,
         )
-        converted = safeyaml.load(blob)
+        converted = yaml.safe_load(blob)
         if converted is None:
             LOG.debug("loaded blob returned None, returning default.")
             converted = default
@@ -1012,7 +988,7 @@ def load_yaml(blob, default=None, allowed=(dict,)):
                 % (allowed, type_utils.obj_name(converted))
             )
         loaded = converted
-    except (safeyaml.YAMLError, TypeError, ValueError) as e:
+    except (yaml.YAMLError, TypeError, ValueError) as e:
         msg = "Failed loading yaml blob"
         mark = None
         if hasattr(e, "context_mark") and getattr(e, "context_mark"):
@@ -1031,11 +1007,12 @@ def load_yaml(blob, default=None, allowed=(dict,)):
     return loaded
 
 
-def read_seeded(base="", ext="", timeout=5, retries=10, file_retries=0):
+def read_seeded(base="", ext="", timeout=5, retries=10):
     if base.find("%s") >= 0:
         ud_url = base.replace("%s", "user-data" + ext)
         vd_url = base.replace("%s", "vendor-data" + ext)
         md_url = base.replace("%s", "meta-data" + ext)
+        network_url = base.replace("%s", "network-config" + ext)
     else:
         if features.NOCLOUD_SEED_URL_APPEND_FORWARD_SLASH:
             if base[-1] != "/" and parse.urlparse(base).query == "":
@@ -1044,12 +1021,23 @@ def read_seeded(base="", ext="", timeout=5, retries=10, file_retries=0):
         ud_url = "%s%s%s" % (base, "user-data", ext)
         vd_url = "%s%s%s" % (base, "vendor-data", ext)
         md_url = "%s%s%s" % (base, "meta-data", ext)
+        network_url = "%s%s%s" % (base, "network-config", ext)
+    network = None
+    try:
+        network_resp = url_helper.read_file_or_url(
+            network_url, timeout=timeout, retries=retries
+        )
+    except url_helper.UrlError as e:
+        LOG.debug("No network config provided: %s", e)
+    else:
+        if network_resp.ok():
+            network = load_yaml(network_resp.contents)
     md_resp = url_helper.read_file_or_url(
         md_url, timeout=timeout, retries=retries
     )
     md = None
     if md_resp.ok():
-        md = load_yaml(decode_binary(md_resp.contents), default={})
+        md = load_yaml(md_resp.contents, default={})
 
     ud_resp = url_helper.read_file_or_url(
         ud_url, timeout=timeout, retries=retries
@@ -1071,7 +1059,7 @@ def read_seeded(base="", ext="", timeout=5, retries=10, file_retries=0):
         else:
             LOG.debug("Error in vendor-data response")
 
-    return (md, ud, vd)
+    return md, ud, vd, network
 
 
 def read_conf_d(confd, *, instance_data_file=None) -> dict:
@@ -1088,18 +1076,20 @@ def read_conf_d(confd, *, instance_data_file=None) -> dict:
     # Load them all so that they can be merged
     cfgs = []
     for fn in confs:
+        path = os.path.join(confd, fn)
         try:
             cfgs.append(
                 read_conf(
-                    os.path.join(confd, fn),
+                    path,
                     instance_data_file=instance_data_file,
                 )
             )
+        except PermissionError:
+            LOG.warning(
+                "REDACTED config part %s, insufficient permissions", path
+            )
         except OSError as e:
-            if e.errno == EACCES:
-                LOG.warning(
-                    "REDACTED config part %s/%s for non-root user", confd, fn
-                )
+            LOG.warning("Error accessing file %s: [%s]", path, e)
 
     return mergemanydict(cfgs)
 
@@ -1120,9 +1110,12 @@ def read_conf_with_confd(cfgfile, *, instance_data_file=None) -> dict:
     cfg: dict = {}
     try:
         cfg = read_conf(cfgfile, instance_data_file=instance_data_file)
+    except PermissionError:
+        LOG.warning(
+            "REDACTED config part %s, insufficient permissions", cfgfile
+        )
     except OSError as e:
-        if e.errno == EACCES:
-            LOG.warning("REDACTED config part %s for non-root user", cfgfile)
+        LOG.warning("Error accessing file %s: [%s]", cfgfile, e)
     else:
         cfgs.append(cfg)
 
@@ -1196,10 +1189,10 @@ def dos2unix(contents):
     return contents.replace("\r\n", "\n")
 
 
-HostnameFqdnInfo = namedtuple(
-    "HostnameFqdnInfo",
-    ["hostname", "fqdn", "is_default"],
-)
+class HostnameFqdnInfo(NamedTuple):
+    hostname: str
+    fqdn: str
+    is_default: bool
 
 
 def get_hostname_fqdn(cfg, cloud, metadata_only=False):
@@ -1207,7 +1200,7 @@ def get_hostname_fqdn(cfg, cloud, metadata_only=False):
 
     @param cfg: Dictionary of merged user-data configuration (from init.cfg).
     @param cloud: Cloud instance from init.cloudify().
-    @param metadata_only: Boolean, set True to only query cloud meta-data,
+    @param metadata_only: Boolean, set True to only query meta-data,
         returning None if not present in meta-data.
     @return: a namedtuple of
         <hostname>, <fqdn>, <is_default> (str, str, bool).
@@ -1222,7 +1215,7 @@ def get_hostname_fqdn(cfg, cloud, metadata_only=False):
     is_default = False
     if "fqdn" in cfg:
         # user specified a fqdn.  Default hostname then is based off that
-        fqdn = cfg["fqdn"]
+        fqdn = str(cfg["fqdn"])
         hostname = get_cfg_option_str(cfg, "hostname", fqdn.split(".")[0])
     else:
         if "hostname" in cfg and cfg["hostname"].find(".") > 0:
@@ -1262,7 +1255,7 @@ def get_fqdn_from_hosts(hostname, filename="/etc/hosts"):
     """
     fqdn = None
     try:
-        for line in load_file(filename).splitlines():
+        for line in load_text_file(filename).splitlines():
             hashpos = line.find("#")
             if hashpos >= 0:
                 line = line[0:hashpos]
@@ -1285,6 +1278,7 @@ def get_fqdn_from_hosts(hostname, filename="/etc/hosts"):
     return fqdn
 
 
+@performance.timed("Resolving URL")
 def is_resolvable(url) -> bool:
     """determine if a url's network address is resolvable, return a boolean
     This also attempts to be resilent against dns redirection.
@@ -1350,12 +1344,7 @@ def gethostbyaddr(ip):
 
 def is_resolvable_url(url):
     """determine if this url is resolvable (existing or ip)."""
-    return log_time(
-        logfunc=LOG.debug,
-        msg="Resolving URL: " + url,
-        func=is_resolvable,
-        args=(url,),
-    )
+    return is_resolvable(url)
 
 
 def search_for_mirror(candidates):
@@ -1375,20 +1364,6 @@ def search_for_mirror(candidates):
         except Exception:
             pass
     return None
-
-
-def close_stdin():
-    """
-    reopen stdin as /dev/null so even subprocesses or other os level things get
-    /dev/null as input.
-
-    if _CLOUD_INIT_SAVE_STDIN is set in environment to a non empty and true
-    value then input will not be closed (useful for debugging).
-    """
-    if is_true(os.environ.get("_CLOUD_INIT_SAVE_STDIN")):
-        return
-    with open(os.devnull) as fp:
-        os.dup2(fp.fileno(), sys.stdin.fileno())
 
 
 def find_devs_with_freebsd(
@@ -1417,6 +1392,7 @@ def find_devs_with_netbsd(
     devlist = []
     label = None
     _type = None
+    mscdlabel_out = ""
     if criteria:
         if criteria.startswith("LABEL="):
             label = criteria.lstrip("LABEL=")
@@ -1577,30 +1553,41 @@ def uniq_list(in_list):
     return out_list
 
 
-def load_file(fname, read_cb=None, quiet=False, decode=True):
+def load_binary_file(
+    fname: Union[str, os.PathLike],
+    *,
+    read_cb: Optional[Callable[[int], None]] = None,
+    quiet: bool = False,
+) -> bytes:
+    timer = performance.Timed("", log_mode="skip")
     LOG.debug("Reading from %s (quiet=%s)", fname, quiet)
-    ofh = io.BytesIO()
-    try:
-        with open(fname, "rb") as ifh:
-            pipe_in_out(ifh, ofh, chunk_cb=read_cb)
-    except IOError as e:
-        if not quiet:
-            raise
-        if e.errno != ENOENT:
-            raise
-    contents = ofh.getvalue()
-    LOG.debug("Read %s bytes from %s", len(contents), fname)
-    if decode:
-        return decode_binary(contents)
-    else:
-        return contents
+    with timer:
+        with io.BytesIO() as ofh:
+            try:
+                with open(fname, "rb") as ifh:
+                    pipe_in_out(ifh, ofh, chunk_cb=read_cb)
+            except FileNotFoundError:
+                if not quiet:
+                    raise
+            contents = ofh.getvalue()
+    LOG.debug("Reading %s bytes from %s%s", len(contents), fname, timer.output)
+    return contents
+
+
+def load_text_file(
+    fname: Union[str, os.PathLike],
+    *,
+    read_cb: Optional[Callable[[int], None]] = None,
+    quiet: bool = False,
+) -> str:
+    return decode_binary(load_binary_file(fname, read_cb=read_cb, quiet=quiet))
 
 
 @lru_cache()
 def _get_cmdline():
     if is_container():
         try:
-            contents = load_file("/proc/1/cmdline")
+            contents = load_text_file("/proc/1/cmdline")
             # replace nulls with space and drop trailing null
             cmdline = contents.replace("\x00", " ")[:-1]
         except Exception as e:
@@ -1608,7 +1595,7 @@ def _get_cmdline():
             cmdline = ""
     else:
         try:
-            cmdline = load_file("/proc/cmdline").strip()
+            cmdline = load_text_file("/proc/cmdline").strip()
         except Exception:
             cmdline = ""
 
@@ -1625,7 +1612,7 @@ def get_cmdline():
 def fips_enabled() -> bool:
     fips_proc = "/proc/sys/crypto/fips_enabled"
     try:
-        contents = load_file(fips_proc).strip()
+        contents = load_text_file(fips_proc).strip()
         return contents == "1"
     except (IOError, OSError):
         # for BSD systems and Linux systems where the proc entry is not
@@ -1640,11 +1627,11 @@ def pipe_in_out(in_fh, out_fh, chunk_size=1024, chunk_cb=None):
         data = in_fh.read(chunk_size)
         if len(data) == 0:
             break
-        else:
-            out_fh.write(data)
-            bytes_piped += len(data)
-            if chunk_cb:
-                chunk_cb(bytes_piped)
+        out_fh.write(data)
+        bytes_piped += len(data)
+        if chunk_cb:
+            chunk_cb(bytes_piped)
+
     out_fh.flush()
     return bytes_piped
 
@@ -1670,17 +1657,46 @@ def chownbyname(fname, user=None, group=None):
     chownbyid(fname, uid, gid)
 
 
-# Always returns well formated values
-# cfg is expected to have an entry 'output' in it, which is a dictionary
-# that includes entries for 'init', 'config', 'final' or 'all'
-#   init: /var/log/cloud.out
-#   config: [ ">> /var/log/cloud-config.out", /var/log/cloud-config.err ]
-#   final:
-#     output: "| logger -p"
-#     error: "> /dev/null"
-# this returns the specific 'mode' entry, cleanly formatted, with value
-def get_output_cfg(cfg, mode):
-    ret = [None, None]
+def get_output_cfg(
+    cfg: Dict[str, Any], mode: Optional[str]
+) -> List[Optional[str]]:
+    """Get the output configuration for a given mode.
+
+    The output config is a dictionary that specifies how to deal with stdout
+    and stderr for the cloud-init modules. It is a (frustratingly) flexible
+    format that can take multiple forms such as:
+        output: { all: "| tee -a /var/log/cloud-init-output.log" }
+    or
+        output:
+            init:
+                output: "> /var/log/cloud-init.out"
+                error: "> /var/log/cloud-init.err"
+            config: "tee -a /var/log/cloud-config.log"
+            final:
+                - ">> /var/log/cloud-final.out"
+                - "/var/log/cloud-final.err"
+
+    Mode can be one of the configuration stages. If you pass a
+    non-existent mode, it will assume the "all" mode configuration if
+    defined.
+
+    Stderr can be specified as &1 to indicate that it should
+    be the same as stdout.
+
+    If a file is specified with no redirection, it will default to
+    appending to the file.
+
+    If not overridden, output is provided in
+    '/etc/cloud/config/cloud.cfg.d/05_logging.cfg' and defaults to:
+        {"all": "| tee -a /var/log/cloud-init-output.log"}
+
+    :param cfg: The base configuration that may or may not contain the
+        'output' configuration dictionary
+    :param mode: The mode to get the output configuration for.
+    :return: A list of two strings (or Nones), the first for stdout for the
+        specified mode and the second for stderr.
+    """
+    ret: List[Optional[str]] = [None, None]
     if not cfg or "output" not in cfg:
         return ret
 
@@ -1688,6 +1704,8 @@ def get_output_cfg(cfg, mode):
     if mode in outcfg:
         modecfg = outcfg[mode]
     else:
+        # TODO: This makes no sense. If they ask for "junk" mode we give
+        # them back "all" if it exists?
         if "all" not in outcfg:
             return ret
         # if there is a 'all' item in the output list
@@ -1705,7 +1723,7 @@ def get_output_cfg(cfg, mode):
         if len(modecfg) > 1:
             ret[1] = modecfg[1]
 
-    # if it is a dictionary, expect 'out' and 'error'
+    # if it is a dictionary, expect 'output' and 'error'
     # items, which indicate out and error
     if isinstance(modecfg, dict):
         if "output" in modecfg:
@@ -1719,10 +1737,10 @@ def get_output_cfg(cfg, mode):
         ret[1] = ret[0]
 
     swlist = [">>", ">", "|"]
-    for i in range(len(ret)):
-        if not ret[i]:
+    for i, r in enumerate(ret):
+        if not r:
             continue
-        val = ret[i].lstrip()
+        val = r.lstrip()
         found = False
         for s in swlist:
             if val.startswith(s):
@@ -1737,12 +1755,23 @@ def get_output_cfg(cfg, mode):
     return ret
 
 
-def get_config_logfiles(cfg):
+def get_config_logfiles(cfg: Dict[str, Any]):
     """Return a list of log file paths from the configuration dictionary.
+
+    Obtains the paths from the 'def_log_file' and 'output' configuration
+    defined in the base configuration.
+
+    If not provided in base configuration, 'def_log_file' is specified in
+    'cloudinit/settings.py' and defaults to:
+        /var/log/cloud-init.log
+    If not overridden, output is provided in
+    '/etc/cloud/config/cloud.cfg.d/05_logging.cfg' and defaults to:
+        {"all": "| tee -a /var/log/cloud-init-output.log"}
 
     @param cfg: The cloud-init merged configuration dictionary.
     """
-    logs = []
+    logs: List = []
+    rotated_logs = []
     if not cfg or not isinstance(cfg, dict):
         return logs
     default_log = cfg.get("def_log_file")
@@ -1760,25 +1789,16 @@ def get_config_logfiles(cfg):
             logs.append(target)
         elif ["tee", "-a"] == parts[:2]:
             logs.append(parts[2])
-    return list(set(logs))
 
+    # add rotated log files
+    for logfile in logs:
+        for rotated_logfile in glob.glob(f"{logfile}*"):
+            # Check that log file exists and is rotated.
+            # Do not add current one
+            if os.path.isfile(rotated_logfile) and rotated_logfile != logfile:
+                rotated_logs.append(rotated_logfile)
 
-def logexc(log, msg, *args):
-    # Setting this here allows this to change
-    # levels easily (not always error level)
-    # or even desirable to have that much junk
-    # coming out to a non-debug stream
-    if msg:
-        log.warning(msg, *args)
-    # Debug gets the full trace.  However, nose has a bug whereby its
-    # logcapture plugin doesn't properly handle the case where there is no
-    # actual exception.  To avoid tracebacks during the test suite then, we'll
-    # do the actual exc_info extraction here, and if there is no exception in
-    # flight, we'll just pass in None.
-    exc_info = sys.exc_info()
-    if exc_info == (None, None, None):
-        exc_info = None
-    log.debug(msg, exc_info=exc_info, *args)
+    return list(set(logs + rotated_logs))
 
 
 def hash_blob(blob, routine: str, mlen=None) -> str:
@@ -1790,18 +1810,6 @@ def hash_blob(blob, routine: str, mlen=None) -> str:
         return digest[0:mlen]
     else:
         return digest
-
-
-def hash_buffer(f: io.BufferedIOBase) -> bytes:
-    """Hash the content of a binary buffer using SHA1.
-
-    @param f: buffered binary stream to hash.
-    @return: digested data as bytes.
-    """
-    hasher = hashlib.sha1()
-    for chunk in iter(lambda: f.read(io.DEFAULT_BUFFER_SIZE), b""):
-        hasher.update(chunk)
-    return hasher.digest()
 
 
 def is_user(name):
@@ -1831,6 +1839,7 @@ def ensure_dirs(dirlist, mode=0o755):
         ensure_dir(d, mode)
 
 
+@performance.timed("Loading json")
 def load_json(text, root_types=(dict,)):
     decoded = json.loads(decode_binary(text))
     if not isinstance(decoded, tuple(root_types)):
@@ -1864,7 +1873,11 @@ def ensure_dir(path, mode=None, user=None, group=None):
         # Get non existed parent dir first before they are created.
         non_existed_parent_dir = get_non_exist_parent_dir(path)
         # Make the dir and adjust the mode
-        with SeLinuxGuard(os.path.dirname(path), recursive=True):
+        dir_name = os.path.dirname(path)
+        selinux_recursive = True
+        if dir_name == "/":
+            selinux_recursive = False
+        with SeLinuxGuard(dir_name, recursive=selinux_recursive):
             os.makedirs(path)
         chmod(path, mode)
         # Change the ownership
@@ -1897,27 +1910,29 @@ def mounts():
     try:
         # Go through mounts to see what is already mounted
         if os.path.exists("/proc/mounts"):
-            mount_locs = load_file("/proc/mounts").splitlines()
+            mount_locs = load_text_file("/proc/mounts").splitlines()
             method = "proc"
         else:
             out = subp.subp("mount")
             mount_locs = out.stdout.splitlines()
             method = "mount"
-        mountre = r"^(/dev/[\S]+) on (/.*) \((.+), .+, (.+)\)$"
+        mountre = re.compile(r"^(/dev/[\S]+) on (/.*) \((.+), .+, (.+)\)$")
         for mpline in mount_locs:
             # Linux: /dev/sda1 on /boot type ext4 (rw,relatime,data=ordered)
             # FreeBSD: /dev/vtbd0p2 on / (ufs, local, journaled soft-updates)
-            try:
-                if method == "proc":
-                    (dev, mp, fstype, opts, _freq, _passno) = mpline.split()
-                else:
-                    m = re.search(mountre, mpline)
-                    dev = m.group(1)
-                    mp = m.group(2)
-                    fstype = m.group(3)
-                    opts = m.group(4)
-            except Exception:
-                continue
+            if method == "proc":
+                words = mpline.split()
+                if len(words) != 6:
+                    continue
+                (dev, mp, fstype, opts, _freq, _passno) = words
+            else:
+                m = mountre.search(mpline)
+                if m is None or len(m.groups()) < 4:
+                    continue
+                dev = m.group(1)
+                mp = m.group(2)
+                fstype = m.group(3)
+                opts = m.group(4)
             # If the name of the mount point contains spaces these
             # can be escaped as '\040', so undo that..
             mp = mp.replace("\\040", " ")
@@ -2052,9 +2067,8 @@ def del_file(path):
     LOG.debug("Attempting to remove %s", path)
     try:
         os.unlink(path)
-    except OSError as e:
-        if e.errno != ENOENT:
-            raise e
+    except FileNotFoundError:
+        pass
 
 
 def copy(src, dest):
@@ -2072,17 +2086,19 @@ def time_rfc2822():
 
 @lru_cache()
 def boottime():
-    """Use sysctlbyname(3) via ctypes to find kern.boottime
+    """Use sysctl(3) via ctypes to find kern.boottime
 
     kern.boottime is of type struct timeval. Here we create a
     private class to easier unpack it.
+    Use sysctl(3) (or sysctl(2) on OpenBSD) because sysctlbyname(3) does not
+    exist on OpenBSD. That complicates retrieval on NetBSD, which #defines
+    KERN_BOOTTIME as 83 instead of 21.
+    21 on NetBSD is KERN_OBOOTTIME, the kern.boottime up until NetBSD 5.0
 
     @return boottime: float to be compatible with linux
     """
     import ctypes
     import ctypes.util
-
-    NULL_BYTES = b"\x00"
 
     class timeval(ctypes.Structure):
         _fields_ = [("tv_sec", ctypes.c_int64), ("tv_usec", ctypes.c_int64)]
@@ -2090,10 +2106,16 @@ def boottime():
     libc = ctypes.CDLL(ctypes.util.find_library("c"))
     size = ctypes.c_size_t()
     size.value = ctypes.sizeof(timeval)
+    mib_values = [  # This corresponds to
+        1,  # CTL_KERN, and
+        21 if not is_NetBSD() else 83,  # KERN_BOOTTIME
+    ]
+    mib = (ctypes.c_int * 2)(*mib_values)
     buf = timeval()
     if (
-        libc.sysctlbyname(
-            b"kern.boottime" + NULL_BYTES,
+        libc.sysctl(
+            mib,
+            ctypes.c_int(len(mib_values)),
             ctypes.byref(buf),
             ctypes.byref(size),
             None,
@@ -2111,7 +2133,7 @@ def uptime():
     try:
         if os.path.exists("/proc/uptime"):
             method = "/proc/uptime"
-            contents = load_file("/proc/uptime")
+            contents = load_text_file("/proc/uptime")
             if contents:
                 uptime_str = contents.split()[0]
         else:
@@ -2211,14 +2233,15 @@ def get_user_groups(username: str) -> List[str]:
     return groups
 
 
+@performance.timed("Writing file")
 def write_file(
     filename,
     content,
     mode=0o644,
     omode="wb",
-    preserve_mode=False,
+    preserve_mode: bool = False,
     *,
-    ensure_dir_exists=True,
+    ensure_dir_exists: bool = True,
     user=None,
     group=None,
 ):
@@ -2405,7 +2428,7 @@ def is_container():
 
     try:
         # Detect Vserver containers
-        lines = load_file("/proc/self/status").splitlines()
+        lines = load_text_file("/proc/self/status").splitlines()
         for line in lines:
             if line.startswith("VxID:"):
                 (_key, val) = line.strip().split(":", 1)
@@ -2422,26 +2445,27 @@ def is_lxd():
     return os.path.exists("/dev/lxd/sock")
 
 
-def get_proc_env(pid, encoding="utf-8", errors="replace"):
+def get_proc_env(
+    pid, encoding: str = "utf-8", errors: str = "replace"
+) -> Dict[str, str]:
     """
     Return the environment in a dict that a given process id was started with.
 
-    @param encoding: if true, then decoding will be done with
-                     .decode(encoding, errors) and text will be returned.
-                     if false then binary will be returned.
-    @param errors:   only used if encoding is true."""
+    @param encoding: decoding will be done with .decode(encoding, errors) and
+    text will be returned.
+    @param errors: passed through .decode(encoding, errors).
+    """
     fn = os.path.join("/proc", str(pid), "environ")
 
+    contents: Union[str, bytes]
     try:
-        contents = load_file(fn, decode=False)
+        contents = load_binary_file(fn)
     except (IOError, OSError):
         return {}
 
     env = {}
-    null, equal = (b"\x00", b"=")
-    if encoding:
-        null, equal = ("\x00", "=")
-        contents = contents.decode(encoding, errors)
+    null, equal = ("\x00", "=")
+    contents = contents.decode(encoding, errors)
 
     for tok in contents.split(null):
         if not tok:
@@ -2506,7 +2530,7 @@ def parse_mount_info(path, mountinfo_lines, log=LOG, get_mnt_opts=False):
     devpth = None
     fs_type = None
     match_mount_point = None
-    match_mount_point_elements = None
+    match_mount_point_elements: Optional[List[str]] = None
     for i, line in enumerate(mountinfo_lines):
         parts = line.split()
 
@@ -2578,7 +2602,7 @@ def parse_mount_info(path, mountinfo_lines, log=LOG, get_mnt_opts=False):
 
 def parse_mtab(path):
     """On older kernels there's no /proc/$$/mountinfo, so use mtab."""
-    for line in load_file("/etc/mtab").splitlines():
+    for line in load_text_file("/etc/mtab").splitlines():
         devpth, mount_point, fs_type = line.split()[:3]
         if mount_point == path:
             return devpth, fs_type, mount_point
@@ -2591,7 +2615,7 @@ def find_freebsd_part(fs):
         return splitted[0]
     elif len(splitted) == 3:
         return splitted[2]
-    elif splitted[2] in ["label", "gpt", "ufs"]:
+    elif splitted[2] in ["label", "gpt", "gptid", "ufs", "ufsid"]:
         target_label = fs[5:]
         (part, _err) = subp.subp(["glabel", "status", "-s"])
         for labels in part.split("\n"):
@@ -2628,26 +2652,6 @@ def get_freebsd_devpth(path):
     return "/dev/" + label_part
 
 
-def get_device_info_from_zpool(zpool):
-    # zpool has 10 second timeout waiting for /dev/zfs LP: #1760173
-    if not os.path.exists("/dev/zfs"):
-        LOG.debug("Cannot get zpool info, no /dev/zfs")
-        return None
-    try:
-        (zpoolstatus, err) = subp.subp(["zpool", "status", zpool])
-    except subp.ProcessExecutionError as err:
-        LOG.warning("Unable to get zpool status of %s: %s", zpool, err)
-        return None
-    if len(err):
-        return None
-    r = r".*(ONLINE).*"
-    for line in zpoolstatus.split("\n"):
-        if re.search(r, line) and zpool not in line and "state" not in line:
-            disk = line.split()[0]
-            LOG.debug('found zpool "%s" on disk %s', zpool, disk)
-            return disk
-
-
 def parse_mount(path, get_mnt_opts=False):
     """Return the mount information for PATH given the lines ``mount(1)``
     This function is compatible with ``util.parse_mount_info()``"""
@@ -2665,7 +2669,7 @@ def parse_mount(path, get_mnt_opts=False):
     devpth = None
     mount_point = None
     match_mount_point = None
-    match_mount_point_elements = None
+    match_mount_point_elements: Optional[List[str]] = None
     for line in mountoutput.splitlines():
         m = re.search(regex, line)
         if not m:
@@ -2766,7 +2770,7 @@ def get_mount_info(path, log=LOG, get_mnt_opts=False):
     # input path.
     mountinfo_path = "/proc/%s/mountinfo" % os.getpid()
     if os.path.exists(mountinfo_path):
-        lines = load_file(mountinfo_path).splitlines()
+        lines = load_text_file(mountinfo_path).splitlines()
         return parse_mount_info(path, lines, log, get_mnt_opts)
     elif os.path.exists("/etc/mtab"):
         return parse_mtab(path)
@@ -2777,55 +2781,6 @@ def get_mount_info(path, log=LOG, get_mnt_opts=False):
 def has_mount_opt(path, opt: str) -> bool:
     *_, mnt_opts = get_mount_info(path, get_mnt_opts=True)
     return opt in mnt_opts.split(",")
-
-
-T = TypeVar("T")
-
-
-def log_time(
-    logfunc,
-    msg,
-    func: Callable[..., T],
-    args=None,
-    kwargs=None,
-    get_uptime=False,
-) -> T:
-    if args is None:
-        args = []
-    if kwargs is None:
-        kwargs = {}
-
-    start = time.time()
-
-    ustart = None
-    if get_uptime:
-        try:
-            ustart = float(uptime())
-        except ValueError:
-            pass
-
-    try:
-        ret = func(*args, **kwargs)
-    finally:
-        delta = time.time() - start
-        udelta = None
-        if ustart is not None:
-            try:
-                udelta = float(uptime()) - ustart
-            except ValueError:
-                pass
-
-        tmsg = " took %0.3f seconds" % delta
-        if get_uptime:
-            if isinstance(udelta, (float)):
-                tmsg += " (%0.2f)" % udelta
-            else:
-                tmsg += " (N/A)"
-        try:
-            logfunc(msg + tmsg)
-        except Exception:
-            pass
-    return ret
 
 
 def expand_dotted_devname(dotted):
@@ -2848,13 +2803,10 @@ def pathprefix2dict(base, required=None, optional=None, delim=os.path.sep):
     ret = {}
     for f in required + optional:
         try:
-            ret[f] = load_file(base + delim + f, quiet=False, decode=False)
-        except IOError as e:
-            if e.errno != ENOENT:
-                raise
+            ret[f] = load_binary_file(base + delim + f, quiet=False)
+        except FileNotFoundError:
             if f in required:
                 missing.append(f)
-
     if len(missing):
         raise ValueError(
             "Missing required files: {files}".format(files=",".join(missing))
@@ -2873,7 +2825,7 @@ def read_meminfo(meminfo="/proc/meminfo", raw=False):
         "MemAvailable:": "available",
     }
     ret = {}
-    for line in load_file(meminfo).splitlines():
+    for line in load_text_file(meminfo).splitlines():
         try:
             key, value, unit = line.split()
         except ValueError:
@@ -2941,13 +2893,11 @@ def is_x86(uname_arch=None):
 
 
 def message_from_string(string):
-    if sys.version_info[:2] < (2, 7):
-        return email.message_from_file(io.StringIO(string))
     return email.message_from_string(string)
 
 
-def get_installed_packages(target=None):
-    out = subp.subp(["dpkg-query", "--list"], target=target, capture=True)
+def get_installed_packages():
+    out = subp.subp(["dpkg-query", "--list"], capture=True)
 
     pkgs_inst = set()
     for line in out.stdout.splitlines():
@@ -2967,7 +2917,7 @@ def system_is_snappy():
     # this is certainly not a perfect test, but good enough for now.
     orpath = "/etc/os-release"
     try:
-        orinfo = load_shell_content(load_file(orpath, quiet=True))
+        orinfo = load_shell_content(load_text_file(orpath, quiet=True))
         if orinfo.get("ID", "").lower() == "ubuntu-core":
             return True
     except ValueError as e:
@@ -2977,7 +2927,7 @@ def system_is_snappy():
     if "snap_core=" in cmdline:
         return True
 
-    content = load_file("/etc/system-image/channel.ini", quiet=True)
+    content = load_text_file("/etc/system-image/channel.ini", quiet=True)
     if "ubuntu-core" in content.lower():
         return True
     if os.path.isdir("/etc/system-image/config.d/"):
@@ -3017,7 +2967,7 @@ def rootdev_from_cmdline(cmdline):
 
 
 def load_shell_content(content, add_empty=False, empty_val=None):
-    """Given shell like syntax (key=value\nkey2=value2\n) in content
+    r"""Given shell like syntax (key=value\nkey2=value2\n) in content
     return the data in dictionary form.  If 'add_empty' is True
     then add entries in to the returned dictionary for 'VAR='
     variables.  Set their value to empty_val."""
@@ -3041,7 +2991,7 @@ def wait_for_files(flist, maxwait, naplen=0.5, log_pre=""):
     waited = 0
     while True:
         need -= set([f for f in need if os.path.exists(f)])
-        if len(need) == 0:
+        if not need:
             LOG.debug(
                 "%sAll files appeared after %s seconds: %s",
                 log_pre,
@@ -3065,6 +3015,18 @@ def wait_for_files(flist, maxwait, naplen=0.5, log_pre=""):
         "%sStill missing files after %s seconds: %s", log_pre, maxwait, need
     )
     return need
+
+
+def wait_for_snap_seeded(cloud):
+    """Helper to wait on completion of snap seeding."""
+
+    def callback():
+        if not subp.which("snap"):
+            LOG.debug("Skipping snap wait, no snap command present")
+            return
+        subp.subp(["snap", "wait", "system", "seed.loaded"])
+
+    cloud.run("snap-seeded", callback, [], freq=PER_ONCE)
 
 
 def mount_is_read_write(mount_point):
@@ -3092,199 +3054,30 @@ def udevadm_settle(exists=None, timeout=None):
     return subp.subp(settle_cmd)
 
 
-def get_proc_ppid_linux(pid):
-    """
-    Return the parent pid of a process by parsing /proc/$pid/stat.
-    """
-    ppid = 0
+def read_hotplug_enabled_file(paths: "Paths") -> dict:
+    content: dict = {"scopes": []}
     try:
-        contents = load_file("/proc/%s/stat" % pid, quiet=True)
-        if contents:
-            # see proc.5 for format
-            m = re.search(r"^\d+ \(.+\) [RSDZTtWXxKPI] (\d+)", str(contents))
-            if m:
-                ppid = int(m.group(1))
-            else:
-                LOG.warning(
-                    "Unable to match parent pid of process pid=%s input: %s",
-                    pid,
-                    contents,
-                )
-    except IOError as e:
-        LOG.warning("Failed to load /proc/%s/stat. %s", pid, e)
-    return ppid
-
-
-def get_proc_ppid_ps(pid):
-    """
-    Return the parent pid of a process by checking ps
-    """
-    ppid, _ = subp.subp(["ps", "-oppid=", "-p", str(pid)])
-    return int(ppid.strip())
-
-
-def get_proc_ppid(pid):
-    """
-    Return the parent pid of a process.
-    """
-    if is_Linux():
-        return get_proc_ppid_linux(pid)
-    else:
-        return get_proc_ppid_ps(pid)
-
-
-def error(msg, rc=1, fmt="Error:\n{}", sys_exit=False):
-    """
-    Print error to stderr and return or exit
-
-    @param msg: message to print
-    @param rc: return code (default: 1)
-    @param fmt: format string for putting message in (default: 'Error:\n {}')
-    @param sys_exit: exit when called (default: false)
-    """
-    print(fmt.format(msg), file=sys.stderr)
-    if sys_exit:
-        sys.exit(rc)
-    return rc
-
-
-@total_ordering
-class Version(namedtuple("Version", ["major", "minor", "patch", "rev"])):
-    def __new__(cls, major=-1, minor=-1, patch=-1, rev=-1):
-        """Default of -1 allows us to tiebreak in favor of the most specific
-        number"""
-        return super(Version, cls).__new__(cls, major, minor, patch, rev)
-
-    @classmethod
-    def from_str(cls, version: str):
-        return cls(*(list(map(int, version.split(".")))))
-
-    def __gt__(self, other):
-        return 1 == self._compare_version(other)
-
-    def __eq__(self, other):
-        return (
-            self.major == other.major
-            and self.minor == other.minor
-            and self.patch == other.patch
-            and self.rev == other.rev
+        content = json.loads(
+            load_text_file(paths.get_cpath("hotplug.enabled"), quiet=False)
         )
-
-    def __iter__(self):
-        """Iterate over the version (drop sentinels)"""
-        for n in (self.major, self.minor, self.patch, self.rev):
-            if n != -1:
-                yield str(n)
-            else:
-                break
-
-    def __str__(self):
-        return ".".join(self)
-
-    def _compare_version(self, other) -> int:
-        """
-        return values:
-            1: self > v2
-            -1: self < v2
-            0: self == v2
-
-        to break a tie between 3.1.N and 3.1, always treat the more
-        specific number as larger
-        """
-        if self == other:
-            return 0
-        if self.major > other.major:
-            return 1
-        if self.minor > other.minor:
-            return 1
-        if self.patch > other.patch:
-            return 1
-        if self.rev > other.rev:
-            return 1
-        return -1
+    except FileNotFoundError:
+        LOG.debug("File not found: %s", paths.get_cpath("hotplug.enabled"))
+    except json.JSONDecodeError as e:
+        LOG.warning(
+            "Ignoring contents of %s because it is not decodable. Error: %s",
+            settings.HOTPLUG_ENABLED_FILE,
+            e,
+        )
+    else:
+        if "scopes" not in content:
+            content["scopes"] = []
+    return content
 
 
-def deprecate(
-    *,
-    deprecated: str,
-    deprecated_version: str,
-    extra_message: Optional[str] = None,
-    schedule: int = 5,
-    return_log: bool = False,
-):
-    """Mark a "thing" as deprecated. Deduplicated deprecations are
-    logged.
+@contextmanager
+def nullcontext() -> Generator[None, Any, None]:
+    """Context manager that does nothing.
 
-    @param deprecated: Noun to be deprecated. Write this as the start
-        of a sentence, with no period. Version and extra message will
-        be appended.
-    @param deprecated_version: The version in which the thing was
-        deprecated
-    @param extra_message: A remedy for the user's problem. A good
-        message will be actionable and specific (i.e., don't use a
-        generic "Use updated key." if the user used a deprecated key).
-        End the string with a period.
-    @param schedule: Manually set the deprecation schedule. Defaults to
-        5 years. Leave a comment explaining your reason for deviation if
-        setting this value.
-    @param return_log: Return log text rather than logging it. Useful for
-        running prior to logging setup.
-
-    Note: uses keyword-only arguments to improve legibility
+    Note: In python-3.7+, this can be substituted by contextlib.nullcontext
     """
-    if not hasattr(deprecate, "_log"):
-        deprecate._log = set()  # type: ignore
-    message = extra_message or ""
-    dedup = hash(deprecated + message + deprecated_version + str(schedule))
-    version = Version.from_str(deprecated_version)
-    version_removed = Version(version.major + schedule, version.minor)
-    deprecate_msg = (
-        f"{deprecated} is deprecated in "
-        f"{deprecated_version} and scheduled to be removed in "
-        f"{version_removed}. {message}"
-    ).rstrip()
-    if return_log:
-        return deprecate_msg
-    if dedup not in deprecate._log:  # type: ignore
-        deprecate._log.add(dedup)  # type: ignore
-        if hasattr(LOG, "deprecated"):
-            LOG.deprecated(deprecate_msg)  # type: ignore
-        else:
-            LOG.warning(deprecate_msg)
-
-
-def deprecate_call(
-    *, deprecated_version: str, extra_message: str, schedule: int = 5
-):
-    """Mark a "thing" as deprecated. Deduplicated deprecations are
-    logged.
-
-    @param deprecated_version: The version in which the thing was
-        deprecated
-    @param extra_message: A remedy for the user's problem. A good
-        message will be actionable and specific (i.e., don't use a
-        generic "Use updated key." if the user used a deprecated key).
-        End the string with a period.
-    @param schedule: Manually set the deprecation schedule. Defaults to
-        5 years. Leave a comment explaining your reason for deviation if
-        setting this value.
-
-    Note: uses keyword-only arguments to improve legibility
-    """
-
-    def wrapper(func):
-        @functools.wraps(func)
-        def decorator(*args, **kwargs):
-            # don't log message multiple times
-            out = func(*args, **kwargs)
-            deprecate(
-                deprecated_version=deprecated_version,
-                deprecated=func.__name__,
-                extra_message=extra_message,
-                schedule=schedule,
-            )
-            return out
-
-        return decorator
-
-    return wrapper
+    yield

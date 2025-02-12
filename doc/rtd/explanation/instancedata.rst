@@ -1,23 +1,21 @@
-.. _instance_metadata:
+.. _instance-data:
 
 
-Instance metadata
-*****************
+Instance-data
+*************
 
 .. toctree::
    :maxdepth: 1
    :hidden:
 
-   kernel-cmdline.rst
+   kernel-command-line.rst
 
 What is ``instance-data?``
 ==========================
 
-Each cloud provider presents unique configuration metadata to a launched cloud
-instance. ``Cloud-init`` crawls this metadata and then caches and exposes this
-information as a standardised and versioned JSON object known as
-``instance-data``. This ``instance-data`` may then be queried or later used
-by ``cloud-init`` in templated configuration and scripts.
+``instance-data`` is a JSON object which contains instance-specific variables
+in a standardized format. These variables may be used in ``cloud-init``
+templated cloud-init configurations.
 
 An example of a small subset of instance-data on a launched EC2 instance:
 
@@ -42,13 +40,12 @@ An example of a small subset of instance-data on a launched EC2 instance:
 Discovery
 =========
 
-One way to easily explore which ``instance-data`` variables are available on
-your machine is to use the :ref:`cloud-init query<cli_query>` tool.
-Warnings or exceptions will be raised on invalid ``instance-data`` keys,
-paths or invalid syntax.
+``instance-data`` can be inspected on a launched instance using
+:ref:`cloud-init query<cli_query>`. Warnings or exceptions will be raised
+on invalid ``instance-data`` keys, paths, or invalid syntax.
 
 The :command:`query` command also publishes ``userdata`` and ``vendordata``
-keys to the root user which will contain the decoded user and vendor data
+keys to the root user which will contain the decoded user-data and vendor-data
 provided to this instance. Non-root users referencing ``userdata`` or
 ``vendordata`` keys will see only redacted values.
 
@@ -63,10 +60,10 @@ provided to this instance. Non-root users referencing ``userdata`` or
 Using ``instance-data``
 =======================
 
-``instance-data`` can be used in:
+``instance-data`` can be used in the following configuration types:
 
-* :ref:`User data scripts<user_data_script>`.
-* :ref:`Cloud-config data<user_data_formats>`.
+* :ref:`User-data scripts<user_data_script>`.
+* :ref:`Cloud-config<user_data_formats-cloud_config>`.
 * :ref:`Base configuration<configuration>`.
 * Command line interface via :command:`cloud-init query` or
   :command:`cloud-init devel render`.
@@ -104,7 +101,7 @@ Example: Cloud config with ``instance-data``
          "availability-zone": "{{ v1.availability_zone }}"}'
          https://example.com
 
-Example: User data script with ``instance-data``
+Example: User-data script with ``instance-data``
 ------------------------------------------------
 
 .. code-block:: jinja
@@ -160,12 +157,15 @@ Storage locations
 -----------------
 
 * :file:`/run/cloud-init/instance-data.json`: world-readable JSON containing
-  standardised keys, sensitive keys redacted.
+  standardized keys, sensitive keys redacted.
 * :file:`/run/cloud-init/instance-data-sensitive.json`: root-readable
   unredacted JSON blob.
 * :file:`/run/cloud-init/combined-cloud-config.json`: root-readable
   unredacted JSON blob. Any meta-data, vendor-data and user-data overrides
-  are applied to the :file:`/run/cloud-init/combined-cloud-config.json` config values.
+  are applied to the :file:`/run/cloud-init/combined-cloud-config.json` config
+  values.
+
+.. _instance-data-keys:
 
 :file:`instance-data.json` top level keys
 -----------------------------------------
@@ -214,9 +214,9 @@ included in the ``sensitive-keys`` list which is only readable by root.
 ``ds``
 ^^^^^^
 
-Datasource-specific metadata crawled for the specific cloud platform. It should
-closely represent the structure of the cloud metadata crawled. The structure of
-content and details provided are entirely cloud-dependent. Mileage will vary
+Datasource-specific data crawled for the specific cloud platform. It should
+closely represent the structure of the data crawled. The structure of content
+and details provided are entirely cloud-dependent. Mileage will vary
 depending on what the cloud exposes. The content exposed under the ``ds`` key
 is currently **experimental** and expected to change slightly in the upcoming
 ``cloud-init`` release.
@@ -232,19 +232,19 @@ represents the data collected by ``cloudinit.util.system_info``.
 
 This is a cloud-init configuration key present in :file:`/etc/cloud/cloud.cfg`
 which describes cloud-init's configured `default_user`, `distro`, `network`
-renderes, and `paths` that cloud-init will use. Not to be confused with the
+renderers, and `paths` that cloud-init will use. Not to be confused with the
 underlying host ``sys_info`` key above.
 
 ``v1``
 ^^^^^^
 
-Standardised ``cloud-init`` metadata keys, these keys are guaranteed to exist
+Standardized ``cloud-init`` data keys, these keys are guaranteed to exist
 on all cloud platforms. They will also retain their current behaviour and
 format, and will be carried forward even if ``cloud-init`` introduces a new
-version of standardised keys with ``v2``.
+version of standardized keys with ``v2``.
 
 To cut down on keystrokes on the command line, ``cloud-init`` also provides
-top-level key aliases for any standardised ``v#`` keys present. The preceding
+top-level key aliases for any standardized ``v#`` keys present. The preceding
 ``v1`` is not required of ``v1.var_name`` These aliases will represent the
 value of the highest versioned standard key. For example, ``cloud_name``
 value will be ``v2.cloud_name`` if both ``v1`` and ``v2`` keys are present in
@@ -257,13 +257,13 @@ jinja-safe key alias. This allows for ``cloud-init`` templates to use aliased
 variable references which allow for jinja's dot-notation reference such as
 ``{{ ds.v1_0.my_safe_key }}`` instead of ``{{ ds["v1.0"]["my/safe-key"] }}``.
 
-Standardised :file:`instance-data.json` v1 keys
+Standardized :file:`instance-data.json` v1 keys
 -----------------------------------------------
 
 ``v1._beta_keys``
 ^^^^^^^^^^^^^^^^^
 
-List of standardised keys still in 'beta'. The format, intent or presence of
+List of standardized keys still in 'beta'. The format, intent or presence of
 these keys can change. Do not consider them production-ready.
 
 Example output:
@@ -307,6 +307,8 @@ Example output:
   - sles, 12.3, x86_64
   - ubuntu, 20.04, focal
 
+.. _v1_instance_id:
+
 ``v1.instance_id``
 ^^^^^^^^^^^^^^^^^^
 
@@ -332,8 +334,8 @@ The internal or local hostname of the system.
 
 Example output:
 
-  - ip-10-41-41-70
-  - <user-provided-hostname>
+  - ``ip-10-41-41-70``
+  - ``<user-provided-hostname>``
 
 ``v1.machine``
 ^^^^^^^^^^^^^^
@@ -365,8 +367,7 @@ Example output:
 ``v1.subplatform``
 ^^^^^^^^^^^^^^^^^^
 
-Additional platform details describing the specific source or type of metadata
-used. The format of subplatform will be:
+Detailed platform information. Subplatform format is:
 
 ``<subplatform_type> (<url_file_or_dev_path>)``
 
@@ -380,7 +381,7 @@ Example output:
 ``v1.public_ssh_keys``
 ^^^^^^^^^^^^^^^^^^^^^^
 
-A list of SSH keys provided to the instance by the datasource metadata.
+A list of SSH keys provided to the instance by the datasource.
 
 Example output:
 
@@ -445,7 +446,7 @@ EC2 instance:
      "grub_dpkg",
      "apt_pipelining",
      "apt_configure",
-     "ubuntu_advantage",
+     "ubuntu_pro",
      "ntp",
      "timezone",
      "disable_ec2_metadata",
@@ -462,7 +463,6 @@ EC2 instance:
      "chef",
      "mcollective",
      "salt_minion",
-     "rightscale_userdata",
      "scripts_vendor",
      "scripts_per_once",
      "scripts_per_boot",
@@ -475,7 +475,6 @@ EC2 instance:
      "power_state_change"
     ],
     "cloud_init_modules": [
-     "migrator",
      "seed_random",
      "bootcmd",
      "write_files",

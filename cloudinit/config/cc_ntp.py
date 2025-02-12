@@ -9,12 +9,12 @@
 import copy
 import logging
 import os
-from textwrap import dedent
+from typing import Dict, Mapping
 
 from cloudinit import subp, temp_utils, templater, type_utils, util
 from cloudinit.cloud import Cloud
 from cloudinit.config import Config
-from cloudinit.config.schema import MetaSchema, get_meta_doc
+from cloudinit.config.schema import MetaSchema
 from cloudinit.settings import PER_INSTANCE
 
 LOG = logging.getLogger(__name__)
@@ -25,6 +25,8 @@ NR_POOL_SERVERS = 4
 distros = [
     "almalinux",
     "alpine",
+    "aosc",
+    "azurelinux",
     "centos",
     "cloudlinux",
     "cos",
@@ -97,7 +99,7 @@ NTP_CLIENT_CONFIG = {
 }
 
 # This is Distro-specific configuration overrides of the base config
-DISTRO_CLIENT_CONFIG = {
+DISTRO_CLIENT_CONFIG: Dict[str, Dict] = {
     "alpine": {
         "chrony": {
             "confpath": "/etc/chrony/chrony.conf",
@@ -107,6 +109,21 @@ DISTRO_CLIENT_CONFIG = {
             "confpath": "/etc/ntp.conf",
             "packages": [],
             "service_name": "ntpd",
+        },
+    },
+    "aosc": {
+        "systemd-timesyncd": {
+            "check_exe": "/usr/lib/systemd/systemd-timesyncd",
+            "confpath": "/etc/systemd/timesyncd.conf",
+        },
+    },
+    "azurelinux": {
+        "chrony": {
+            "service_name": "chronyd",
+        },
+        "systemd-timesyncd": {
+            "check_exe": "/usr/lib/systemd/systemd-timesyncd",
+            "confpath": "/etc/systemd/timesyncd.conf",
         },
     },
     "centos": {
@@ -224,6 +241,9 @@ DISTRO_CLIENT_CONFIG = {
 for distro in ("opensuse-microos", "opensuse-tumbleweed", "opensuse-leap"):
     DISTRO_CLIENT_CONFIG[distro] = DISTRO_CLIENT_CONFIG["opensuse"]
 
+for distro in ("almalinux", "cloudlinux", "rocky"):
+    DISTRO_CLIENT_CONFIG[distro] = DISTRO_CLIENT_CONFIG["rhel"]
+
 for distro in ("sle_hpc", "sle-micro"):
     DISTRO_CLIENT_CONFIG[distro] = DISTRO_CLIENT_CONFIG["sles"]
 
@@ -235,77 +255,10 @@ for distro in ("sle_hpc", "sle-micro"):
 
 meta: MetaSchema = {
     "id": "cc_ntp",
-    "name": "NTP",
-    "title": "enable and configure ntp",
-    "description": dedent(
-        """\
-        Handle ntp configuration. If ntp is not installed on the system and
-        ntp configuration is specified, ntp will be installed. If there is a
-        default ntp config file in the image or one is present in the
-        distro's ntp package, it will be copied to a file with ``.dist``
-        appended to the filename before any changes are made. A list of ntp
-        pools and ntp servers can be provided under the ``ntp`` config key.
-        If no ntp ``servers`` or ``pools`` are provided, 4 pools will be used
-        in the format ``{0-3}.{distro}.pool.ntp.org``."""
-    ),
     "distros": distros,
-    "examples": [
-        dedent(
-            """\
-        # Override ntp with chrony configuration on Ubuntu
-        ntp:
-          enabled: true
-          ntp_client: chrony  # Uses cloud-init default chrony configuration
-        """
-        ),
-        dedent(
-            """\
-        # Provide a custom ntp client configuration
-        ntp:
-          enabled: true
-          ntp_client: myntpclient
-          config:
-             confpath: /etc/myntpclient/myntpclient.conf
-             check_exe: myntpclientd
-             packages:
-               - myntpclient
-             service_name: myntpclient
-             template: |
-                 ## template:jinja
-                 # My NTP Client config
-                 {% if pools -%}# pools{% endif %}
-                 {% for pool in pools -%}
-                 pool {{pool}} iburst
-                 {% endfor %}
-                 {%- if servers %}# servers
-                 {% endif %}
-                 {% for server in servers -%}
-                 server {{server}} iburst
-                 {% endfor %}
-                 {% if peers -%}# peers{% endif %}
-                 {% for peer in peers -%}
-                 peer {{peer}}
-                 {% endfor %}
-                 {% if allow -%}# allow{% endif %}
-                 {% for cidr in allow -%}
-                 allow {{cidr}}
-                 {% endfor %}
-          pools: [0.int.pool.ntp.org, 1.int.pool.ntp.org, ntp.myorg.org]
-          servers:
-            - ntp.server.local
-            - ntp.ubuntu.com
-            - 192.168.23.2
-          allow:
-            - 192.168.23.0/32
-          peers:
-            - km001
-            - km002"""
-        ),
-    ],
     "frequency": PER_INSTANCE,
     "activate_by_schema_keys": ["ntp"],
 }
-__doc__ = get_meta_doc(meta)
 
 
 REQUIRED_NTP_CONFIG_KEYS = frozenset(
@@ -327,7 +280,7 @@ def distro_ntp_client_configs(distro):
     return cfg
 
 
-def select_ntp_client(ntp_client, distro):
+def select_ntp_client(ntp_client, distro) -> Mapping:
     """Determine which ntp client is to be used, consulting the distro
        for its preference.
 
@@ -366,7 +319,7 @@ def select_ntp_client(ntp_client, distro):
                 'Selected distro preferred NTP client "%s", not yet installed',
                 client,
             )
-            clientcfg = distro_cfg.get(client)
+            clientcfg = distro_cfg.get(client, {})
     else:
         LOG.debug(
             'Selected NTP client "%s" via distro system config',
@@ -423,7 +376,7 @@ def generate_server_names(distro):
         # so use general x.pool.ntp.org instead. The same applies to EuroLinux
         pool_distro = ""
 
-    for x in range(0, NR_POOL_SERVERS):
+    for x in range(NR_POOL_SERVERS):
         names.append(
             ".".join(
                 [n for n in [str(x)] + [pool_distro] + ["pool.ntp.org"] if n]
@@ -474,18 +427,14 @@ def write_ntp_config_template(
     if not peers:
         peers = []
 
-    if len(servers) == 0 and len(pools) == 0 and distro_name == "cos":
+    if not servers and not pools and distro_name == "cos":
         return
-    if (
-        len(servers) == 0
-        and distro_name == "alpine"
-        and service_name == "ntpd"
-    ):
+    if not servers and distro_name == "alpine" and service_name == "ntpd":
         # Alpine's Busybox ntpd only understands "servers" configuration
         # and not "pool" configuration.
         servers = generate_server_names(distro_name)
         LOG.debug("Adding distro default ntp servers: %s", ",".join(servers))
-    elif len(servers) == 0 and len(pools) == 0:
+    elif not (servers) and not (pools):
         pools = generate_server_names(distro_name)
         LOG.debug(
             "Adding distro default ntp pool servers: %s", ",".join(pools)
@@ -613,7 +562,7 @@ def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
 
     template_fn = None
     if not ntp_client_config.get("template"):
-        template_name = ntp_client_config.get("template_name").replace(
+        template_name = ntp_client_config["template_name"].replace(
             "{distro}", cloud.distro.name
         )
         template_fn = cloud.get_template_filename(template_name)
@@ -659,14 +608,14 @@ def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
 
         try:
             cloud.distro.manage_service(
-                "enable", ntp_client_config.get("service_name")
+                "enable", ntp_client_config["service_name"]
             )
         except subp.ProcessExecutionError as e:
             LOG.exception("Failed to enable ntp service: %s", e)
             raise
     try:
         cloud.distro.manage_service(
-            "reload", ntp_client_config.get("service_name")
+            "reload", ntp_client_config["service_name"]
         )
     except subp.ProcessExecutionError as e:
         LOG.exception("Failed to reload/start ntp service: %s", e)

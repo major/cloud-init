@@ -7,6 +7,7 @@ Any imports that are performed at the top-level here must be installed wherever
 any of these tests run: that is to say, they must be listed in
 ``integration-requirements.txt`` and in ``test-requirements.txt``.
 """
+
 # If we don't import this early, lru_cache may get applied before we have the
 # chance to patch. This is also too early for the pytest-antilru plugin
 # to work.
@@ -79,6 +80,14 @@ class _FixtureUtils:
         return result[0]
 
 
+class UnexpectedSubpError(BaseException):
+    """Error thrown when subp.subp is unexpectedly used.
+
+    We inherit from BaseException so it doesn't get silently swallowed
+    by other error handlers.
+    """
+
+
 @pytest.fixture(autouse=True)
 def disable_subp_usage(request, fixture_utils):
     """
@@ -142,12 +151,12 @@ def disable_subp_usage(request, fixture_utils):
     if allow_all_subp is None and allow_subp_for is None:
         # No marks, default behaviour; disallow all subp.subp usage
         def side_effect(args, *other_args, **kwargs):
-            raise AssertionError("Unexpectedly used subp.subp")
+            raise UnexpectedSubpError("Unexpectedly used subp.subp")
 
     elif allow_all_subp is not None and allow_subp_for is not None:
         # Both marks, ambiguous request; raise an exception on all subp usage
         def side_effect(args, *other_args, **kwargs):
-            raise AssertionError(
+            raise UnexpectedSubpError(
                 "Test marked both allow_all_subp and allow_subp_for: resolve"
                 " this either by modifying your test code, or by modifying"
                 " disable_subp_usage to handle precedence."
@@ -161,7 +170,7 @@ def disable_subp_usage(request, fixture_utils):
         def side_effect(args, *other_args, **kwargs):
             cmd = args[0]
             if cmd not in allow_subp_for:
-                raise AssertionError(
+                raise UnexpectedSubpError(
                     "Unexpectedly used subp.subp to call {} (allowed:"
                     " {})".format(cmd, ",".join(allow_subp_for))
                 )
@@ -197,7 +206,9 @@ def paths(tmpdir):
     """
     dirs = {
         "cloud_dir": tmpdir.mkdir("cloud_dir").strpath,
+        "docs_dir": tmpdir.mkdir("docs_dir").strpath,
         "run_dir": tmpdir.mkdir("run_dir").strpath,
+        "templates_dir": tmpdir.mkdir("templates_dir").strpath,
     }
     return helpers.Paths(dirs)
 

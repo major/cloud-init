@@ -1,22 +1,32 @@
 """Tests for `cloud-init status`"""
+
 import json
 
 import pytest
 
 from tests.integration_tests.clouds import IntegrationCloud
+from tests.integration_tests.decorators import retry
 from tests.integration_tests.instances import IntegrationInstance
 from tests.integration_tests.integration_settings import PLATFORM
 from tests.integration_tests.releases import CURRENT_RELEASE, IS_UBUNTU, JAMMY
-from tests.integration_tests.util import wait_for_cloud_init
+from tests.integration_tests.util import (
+    push_and_enable_systemd_unit,
+    wait_for_cloud_init,
+)
 
 
 def _remove_nocloud_dir_and_reboot(client: IntegrationInstance):
     # On Impish and below, NoCloud will be detected on an LXD container.
     # If we remove this directory, it will no longer be detected.
     client.execute("rm -rf /var/lib/cloud/seed/nocloud-net")
-    old_boot_id = client.instance.get_boot_id()
-    client.execute("cloud-init clean --logs --reboot")
-    client.instance._wait_for_execute(old_boot_id=old_boot_id)
+    client.instance.clean()
+    client.instance.restart()
+
+
+@retry(tries=30, delay=1)
+def retry_read_from_file(client: IntegrationInstance, path: str):
+    """Retry read_from_file expecting it shortly"""
+    return client.read_from_file(path)
 
 
 @pytest.mark.skipif(not IS_UBUNTU, reason="Only ever tested on Ubuntu")
@@ -24,7 +34,7 @@ def _remove_nocloud_dir_and_reboot(client: IntegrationInstance):
     PLATFORM != "lxd_container",
     reason="Test is LXD specific",
 )
-def test_wait_when_no_datasource(session_cloud: IntegrationCloud, setup_image):
+def test_wait_when_no_datasource(session_cloud: IntegrationCloud):
     """Ensure that when no datasource is found, we get status: disabled
 
     LP: #1966085
@@ -53,8 +63,11 @@ def test_wait_when_no_datasource(session_cloud: IntegrationCloud, setup_image):
 
 USER_DATA = """\
 #cloud-config
-ca-certs:
-  remove_defaults: false
+users:
+  - name: something
+    ssh-authorized-keys: ["something"]
+  - default
+ca_certs:
   invalid_key: true
 """
 
@@ -70,15 +83,96 @@ def test_status_json_errors(client):
     )
 
     status_json = client.execute("cloud-init status --format json").stdout
-    assert "Deprecated cloud-config provided:\nca-certs:" in json.loads(
-        status_json
-    )["init"]["recoverable_errors"].get("DEPRECATED").pop(0)
-    assert "Deprecated cloud-config provided:\nca-certs:" in json.loads(
-        status_json
-    )["recoverable_errors"].get("DEPRECATED").pop(0)
-    assert "Invalid cloud-config provided" in json.loads(status_json)["init"][
+    assert (
+        "Deprecated cloud-config provided: users.0.ssh-authorized-keys"
+        in json.loads(status_json)["init"]["recoverable_errors"]
+        .get("DEPRECATED")
+        .pop(0)
+    )
+    assert (
+        "Deprecated cloud-config provided: users.0.ssh-authorized-keys:"
+        in json.loads(status_json)["recoverable_errors"]
+        .get("DEPRECATED")
+        .pop(0)
+    )
+    assert "cloud-config failed schema validation" in json.loads(status_json)[
+        "init"
+    ]["recoverable_errors"].get("WARNING").pop(0)
+    assert "cloud-config failed schema validation" in json.loads(status_json)[
         "recoverable_errors"
     ].get("WARNING").pop(0)
-    assert "Invalid cloud-config provided" in json.loads(status_json)[
-        "recoverable_errors"
-    ].get("WARNING").pop(0)
+
+
+EARLY_BOOT_WAIT_USER_DATA = """\
+#cloud-config
+write_files:
+- path: /waitoncloudinit.sh
+  permissions: '0755'
+  content: |
+    #!/bin/sh
+    if [ -f /var/lib/cloud/data/status.json ]; then
+        MARKER_FILE="/$1.start-hasstatusjson"
+    else
+        MARKER_FILE="/$1.start-nostatusjson"
+    fi
+    cloud-init status --wait --long > $1
+    date +%s.%N > $MARKER_FILE
+"""
+
+
+BEFORE_CLOUD_INIT_LOCAL = """\
+[Unit]
+Description=BEFORE cloud-init local
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=cloud-init-local.service
+Before=shutdown.target
+Before=sysinit.target
+Conflicts=shutdown.target
+RequiresMountsFor=/var/lib/cloud
+
+[Service]
+Type=simple
+ExecStart=/waitoncloudinit.sh /before-local
+RemainAfterExit=yes
+TimeoutSec=0
+
+# Output needs to appear in instance console output
+StandardOutput=journal+console
+
+[Install]
+WantedBy=cloud-init.target
+"""
+
+
+@pytest.mark.user_data(EARLY_BOOT_WAIT_USER_DATA)
+@pytest.mark.lxd_use_exec
+@pytest.mark.skipif(
+    PLATFORM not in ("lxd_container", "lxd_vm"),
+    reason="Requires use of lxd exec",
+)
+def test_status_block_through_all_boot_status(client):
+    """Assert early boot cloud-init status --wait does not exit early."""
+    push_and_enable_systemd_unit(
+        client, "before-cloud-init-local.service", BEFORE_CLOUD_INIT_LOCAL
+    )
+    client.instance.clean()
+    client.instance.restart()
+    wait_for_cloud_init(client).stdout.strip()
+    client.execute("cloud-init status --wait")
+
+    # Assert that before-cloud-init-local.service started before
+    # cloud-init-local.service could create status.json
+    assert client.execute("test -f /before-local.start-hasstatusjson").failed
+
+    early_unit_timestamp = retry_read_from_file(
+        client, "/before-local.start-nostatusjson"
+    )
+    # Assert the file created at the end of
+    # before-cloud-init-local.service is newer than the last log entry in
+    # /var/log/cloud-init.log
+    events = json.loads(client.execute("cloud-init analyze dump").stdout)
+    final_cloud_init_event = events[-1]["timestamp"]
+    assert final_cloud_init_event < float(
+        early_unit_timestamp
+    ), "Systemd unit didn't block on cloud-init status --wait"

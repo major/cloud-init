@@ -7,7 +7,7 @@ import logging
 from cloudinit import distros, helpers, net, subp, util
 from cloudinit.distros import PackageList
 from cloudinit.distros import rhel_util as rhutil
-from cloudinit.settings import PER_INSTANCE
+from cloudinit.settings import PER_ALWAYS, PER_INSTANCE
 
 LOG = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class Distro(distros.Distro):
     def __init__(self, name, cfg, paths):
         distros.Distro.__init__(self, name, cfg, paths)
         # This will be used to restrict certain
-        # calls from repeatly happening (when they
+        # calls from repeatedly happening (when they
         # should only happen say once per instance...)
         self._runner = helpers.Runners(paths)
         self.osfamily = "photon"
@@ -66,7 +66,7 @@ class Distro(distros.Distro):
         return None
 
     def apply_locale(self, locale, out_fn=None):
-        # This has a dependancy on glibc-i18n, user need to manually install it
+        # This has a dependency on glibc-i18n, user need to manually install it
         # and enable the option in cloud.cfg
         if not out_fn:
             out_fn = self.systemd_locale_conf_fn
@@ -108,6 +108,9 @@ class Distro(distros.Distro):
                         str(hostname),
                     ]
                 )
+                LOG.info(
+                    "create_hostname_file is False; hostname set transiently"
+                )
             if ret:
                 LOG.warning(
                     (
@@ -123,7 +126,7 @@ class Distro(distros.Distro):
 
     def _read_hostname(self, filename, default=None):
         if filename and filename.endswith("/previous-hostname"):
-            return util.load_file(filename).strip()
+            return util.load_text_file(filename).strip()
 
         _ret, out, _err = self.exec_cmd(["hostname", "-f"])
         return out.strip() if out else default
@@ -153,10 +156,10 @@ class Distro(distros.Distro):
         if ret:
             LOG.error("Error while installing packages: %s", err)
 
-    def update_package_sources(self):
+    def update_package_sources(self, *, force=False):
         self._runner.run(
             "update-sources",
             self.package_command,
             ["makecache"],
-            freq=PER_INSTANCE,
+            freq=PER_ALWAYS if force else PER_INSTANCE,
         )

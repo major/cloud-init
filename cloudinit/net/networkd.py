@@ -9,7 +9,7 @@ from collections import OrderedDict
 from typing import Optional
 
 from cloudinit import subp, util
-from cloudinit.net import renderer
+from cloudinit.net import renderer, should_add_gateway_onlink_flag
 from cloudinit.net.network_state import NetworkState
 
 LOG = logging.getLogger(__name__)
@@ -68,7 +68,7 @@ class CfgParser:
                     contents += "[" + k + "]\n"
                     for e in sorted(v[n]):
                         contents += e + "\n"
-                        contents += "\n"
+                    contents += "\n"
             else:
                 contents += "[" + k + "]\n"
                 for e in sorted(v):
@@ -122,6 +122,9 @@ class Renderer(renderer.Renderer):
         if "mtu" in iface and iface["mtu"]:
             cfg.update_section(sec, "MTUBytes", iface["mtu"])
 
+        if "optional" in iface and iface["optional"]:
+            cfg.update_section(sec, "RequiredForOnline", "no")
+
     def parse_routes(self, rid, conf, cfg: CfgParser):
         """
         Parse a route and use rid as a key in order to isolate the route from
@@ -169,6 +172,9 @@ class Renderer(renderer.Renderer):
                     self.parse_routes(f"r{rid}", i, cfg)
                     rid = rid + 1
             if "address" in e:
+                addr = e["address"]
+                if "prefix" in e:
+                    addr += "/" + str(e["prefix"])
                 subnet_cfg_map = {
                     "address": "Address",
                     "gateway": "Gateway",
@@ -177,24 +183,30 @@ class Renderer(renderer.Renderer):
                 }
                 for k, v in e.items():
                     if k == "address":
-                        if "prefix" in e:
-                            v += "/" + str(e["prefix"])
-                        cfg.update_section("Address", subnet_cfg_map[k], v)
+                        cfg.update_section("Address", subnet_cfg_map[k], addr)
                     elif k == "gateway":
                         # Use "a" as a dict key prefix for this route to
                         # isolate it from other sources of routes
                         cfg.update_route_section(
                             "Route", f"a{rid}", subnet_cfg_map[k], v
                         )
+                        if should_add_gateway_onlink_flag(v, addr):
+                            LOG.debug(
+                                "Gateway %s is not contained within subnet %s,"
+                                " adding GatewayOnLink flag",
+                                v,
+                                addr,
+                            )
+                            cfg.update_route_section(
+                                "Route", f"a{rid}", "GatewayOnLink", "yes"
+                            )
                         rid = rid + 1
                     elif k == "dns_nameservers" or k == "dns_search":
                         cfg.update_section(sec, subnet_cfg_map[k], " ".join(v))
 
         cfg.update_section(sec, "DHCP", dhcp)
 
-        if dhcp in ["ipv6", "yes"] and isinstance(
-            iface.get("accept-ra", ""), bool
-        ):
+        if isinstance(iface.get("accept-ra", ""), bool):
             cfg.update_section(sec, "IPv6AcceptRA", iface["accept-ra"])
 
         return dhcp
@@ -221,12 +233,6 @@ class Renderer(renderer.Renderer):
     def parse_dns(self, iface, cfg: CfgParser, ns: NetworkState):
         sec = "Network"
 
-        dns_cfg_map = {
-            "search": "Domains",
-            "nameservers": "DNS",
-            "addresses": "DNS",
-        }
-
         dns = iface.get("dns")
         if not dns and ns.version == 1:
             dns = {
@@ -236,9 +242,10 @@ class Renderer(renderer.Renderer):
         elif not dns and ns.version == 2:
             return
 
-        for k, v in dns_cfg_map.items():
-            if k in dns and dns[k]:
-                cfg.update_section(sec, v, " ".join(dns[k]))
+        if dns.get("search"):
+            cfg.update_section(sec, "Domains", " ".join(dns["search"]))
+        if dns.get("nameservers"):
+            cfg.update_section(sec, "DNS", " ".join(dns["nameservers"]))
 
     def parse_dhcp_overrides(self, cfg: CfgParser, device, dhcp, version):
         dhcp_config_maps = {

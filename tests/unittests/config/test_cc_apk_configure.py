@@ -1,6 +1,6 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
-""" test_apk_configure
+"""test_apk_configure
 Test creation of repositories file
 """
 
@@ -18,6 +18,7 @@ from cloudinit.config.schema import (
     validate_cloudconfig_schema,
 )
 from tests.unittests.helpers import (
+    SCHEMA_EMPTY_ERROR,
     FilesystemMockingTestCase,
     mock,
     skipUnlessJsonSchema,
@@ -50,7 +51,7 @@ class TestNoConfig(FilesystemMockingTestCase):
 
 class TestConfig(FilesystemMockingTestCase):
     def setUp(self):
-        super(TestConfig, self).setUp()
+        super().setUp()
         self.new_root = self.tmp_dir()
         self.new_root = self.reRoot(root=self.new_root)
         for dirname in ["tmp", "etc/apk"]:
@@ -59,6 +60,14 @@ class TestConfig(FilesystemMockingTestCase):
         self.name = "apk_configure"
         self.cloud = cloud.Cloud(None, self.paths, None, None, None)
         self.args = []
+        self.mock = mock.patch(
+            "cloudinit.temp_utils.get_tmp_ancestor", lambda *_: self.new_root
+        )
+        self.mock.start()
+
+    def tearDown(self):
+        self.mock.stop()
+        super().tearDown()
 
     @mock.patch(CC_APK + "._write_repositories_file")
     def test_no_repo_settings(self, m_write_repos):
@@ -107,7 +116,7 @@ class TestConfig(FilesystemMockingTestCase):
             )
         )
 
-        self.assertEqual(expected_content, util.load_file(REPO_FILE))
+        self.assertEqual(expected_content, util.load_text_file(REPO_FILE))
 
     def test_main_and_community_repos(self):
         """
@@ -142,7 +151,7 @@ class TestConfig(FilesystemMockingTestCase):
             )
         )
 
-        self.assertEqual(expected_content, util.load_file(REPO_FILE))
+        self.assertEqual(expected_content, util.load_text_file(REPO_FILE))
 
     def test_main_community_testing_repos(self):
         """
@@ -182,7 +191,7 @@ class TestConfig(FilesystemMockingTestCase):
             )
         )
 
-        self.assertEqual(expected_content, util.load_file(REPO_FILE))
+        self.assertEqual(expected_content, util.load_text_file(REPO_FILE))
 
     def test_edge_main_community_testing_repos(self):
         """
@@ -219,7 +228,7 @@ class TestConfig(FilesystemMockingTestCase):
             )
         )
 
-        self.assertEqual(expected_content, util.load_file(REPO_FILE))
+        self.assertEqual(expected_content, util.load_text_file(REPO_FILE))
 
     def test_main_community_testing_local_repos(self):
         """
@@ -266,7 +275,7 @@ class TestConfig(FilesystemMockingTestCase):
             )
         )
 
-        self.assertEqual(expected_content, util.load_file(REPO_FILE))
+        self.assertEqual(expected_content, util.load_text_file(REPO_FILE))
 
     def test_edge_main_community_testing_local_repos(self):
         """
@@ -310,7 +319,7 @@ class TestConfig(FilesystemMockingTestCase):
             )
         )
 
-        self.assertEqual(expected_content, util.load_file(REPO_FILE))
+        self.assertEqual(expected_content, util.load_text_file(REPO_FILE))
 
 
 class TestApkConfigureSchema:
@@ -355,7 +364,7 @@ class TestApkConfigureSchema:
             (
                 {"apk_repos": {"alpine_repo": {}}},
                 "apk_repos.alpine_repo: 'version' is a required property,"
-                " apk_repos.alpine_repo: {} does not have enough properties",
+                f" apk_repos.alpine_repo: {{}} {SCHEMA_EMPTY_ERROR}",
             ),
             (
                 {"apk_repos": {"alpine_repo": True}},
@@ -368,7 +377,7 @@ class TestApkConfigureSchema:
             ),
             (
                 {"apk_repos": {}},
-                "apk_repos: {} does not have enough properties",
+                f"apk_repos: {{}} {SCHEMA_EMPTY_ERROR}",
             ),
             (
                 {"apk_repos": {"local_repo_base_url": None}},

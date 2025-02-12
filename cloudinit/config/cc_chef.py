@@ -12,41 +12,32 @@ import itertools
 import json
 import logging
 import os
-from textwrap import dedent
 from typing import List
 
 from cloudinit import subp, temp_utils, templater, url_helper, util
 from cloudinit.cloud import Cloud
 from cloudinit.config import Config
-from cloudinit.config.schema import MetaSchema, get_meta_doc
+from cloudinit.config.schema import MetaSchema
 from cloudinit.distros import Distro
 from cloudinit.settings import PER_ALWAYS
 
 RUBY_VERSION_DEFAULT = "1.8"
 
-CHEF_DIRS = tuple(
-    [
-        "/etc/chef",
-        "/var/log/chef",
-        "/var/lib/chef",
-        "/var/cache/chef",
-        "/var/backups/chef",
-        "/var/run/chef",
-    ]
+CHEF_DIRS = (
+    "/etc/chef",
+    "/var/log/chef",
+    "/var/lib/chef",
+    "/var/chef/cache",
+    "/var/backups/chef",
+    "/var/run/chef",
 )
-REQUIRED_CHEF_DIRS = tuple(
-    [
-        "/etc/chef",
-    ]
-)
+REQUIRED_CHEF_DIRS = ("/etc/chef",)
 
 # Used if fetching chef from a omnibus style package
 OMNIBUS_URL = "https://www.chef.io/chef/install.sh"
 OMNIBUS_URL_RETRIES = 5
 
 CHEF_VALIDATION_PEM_PATH = "/etc/chef/validation.pem"
-CHEF_ENCRYPTED_DATA_BAG_PATH = "/etc/chef/encrypted_data_bag_secret"
-CHEF_ENVIRONMENT = "_default"
 CHEF_FB_PATH = "/etc/chef/firstboot.json"
 CHEF_RB_TPL_DEFAULTS = {
     # These are ruby symbols...
@@ -58,7 +49,7 @@ CHEF_RB_TPL_DEFAULTS = {
     "validation_cert": None,
     "client_key": "/etc/chef/client.pem",
     "json_attribs": CHEF_FB_PATH,
-    "file_cache_path": "/var/cache/chef",
+    "file_cache_path": "/var/chef/cache",
     "file_backup_path": "/var/backups/chef",
     "pid_file": "/var/run/chef/client.pid",
     "show_time": True,
@@ -77,76 +68,30 @@ CHEF_RB_TPL_PATH_KEYS = frozenset(
     ]
 )
 CHEF_RB_TPL_KEYS = frozenset(
-    itertools.chain(
-        CHEF_RB_TPL_DEFAULTS.keys(),
-        CHEF_RB_TPL_BOOL_KEYS,
-        CHEF_RB_TPL_PATH_KEYS,
-        [
-            "server_url",
-            "node_name",
-            "environment",
-            "validation_name",
-            "chef_license",
-        ],
-    )
+    [
+        *CHEF_RB_TPL_DEFAULTS.keys(),
+        *CHEF_RB_TPL_BOOL_KEYS,
+        *CHEF_RB_TPL_PATH_KEYS,
+        "server_url",
+        "node_name",
+        "environment",
+        "validation_name",
+        "chef_license",
+    ]
 )
 CHEF_RB_PATH = "/etc/chef/client.rb"
 CHEF_EXEC_PATH = "/usr/bin/chef-client"
-CHEF_EXEC_DEF_ARGS = tuple(["-d", "-i", "1800", "-s", "20"])
+CHEF_EXEC_DEF_ARGS = ("-d", "-i", "1800", "-s", "20")
 
-
-frequency = PER_ALWAYS
-distros = ["all"]
 
 LOG = logging.getLogger(__name__)
 
 meta: MetaSchema = {
     "id": "cc_chef",
-    "name": "Chef",
-    "title": "module that configures, starts and installs chef",
-    "description": dedent(
-        """\
-        This module enables chef to be installed (from packages,
-        gems, or from omnibus). Before this occurs, chef configuration is
-        written to disk (validation.pem, client.pem, firstboot.json,
-        client.rb), and required directories are created (/etc/chef and
-        /var/log/chef and so-on). If configured, chef will be
-        installed and started in either daemon or non-daemon mode.
-        If run in non-daemon mode, post run actions are executed to do
-        finishing activities such as removing validation.pem."""
-    ),
-    "distros": distros,
-    "examples": [
-        dedent(
-            """
-        chef:
-          directories:
-            - /etc/chef
-            - /var/log/chef
-          validation_cert: system
-          install_type: omnibus
-          initial_attributes:
-            apache:
-              prefork:
-                maxclients: 100
-              keepalive: off
-          run_list:
-            - recipe[apache2]
-            - role[db]
-          encrypted_data_bag_secret: /etc/chef/encrypted_data_bag_secret
-          environment: _default
-          log_level: :auto
-          omnibus_url_retries: 2
-          server_url: https://chef.yourorg.com:4000
-          ssl_verify_mode: :verify_peer
-          validation_name: yourorg-validator"""
-        )
-    ],
-    "frequency": frequency,
+    "distros": ["all"],
+    "frequency": PER_ALWAYS,
     "activate_by_schema_keys": ["chef"],
 }
-
-__doc__ = get_meta_doc(meta)
 
 
 def post_run_chef(chef_cfg):
@@ -226,6 +171,9 @@ def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
             )
 
     # Create the chef config from template
+    cfg_filename = util.get_cfg_option_str(
+        chef_cfg, "config_path", default=CHEF_RB_PATH
+    )
     template_fn = cloud.get_template_filename("chef_client.rb")
     if template_fn:
         iid = str(cloud.datasource.get_instance_id())
@@ -238,9 +186,9 @@ def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
             if k in CHEF_RB_TPL_PATH_KEYS and v:
                 param_paths.add(os.path.dirname(v))
         util.ensure_dirs(param_paths)
-        templater.render_to_file(template_fn, CHEF_RB_PATH, params)
+        templater.render_to_file(template_fn, cfg_filename, params)
     else:
-        LOG.warning("No template found, not rendering to %s", CHEF_RB_PATH)
+        LOG.warning("No template found, not rendering to %s", cfg_filename)
 
     # Set the firstboot json
     fb_filename = util.get_cfg_option_str(

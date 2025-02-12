@@ -5,19 +5,21 @@ from textwrap import dedent
 
 import pytest
 
-from cloudinit import gpg
 from cloudinit.config import cc_apt_configure
 from cloudinit.util import is_true
+from tests.integration_tests.clouds import IntegrationCloud
 from tests.integration_tests.instances import IntegrationInstance
 from tests.integration_tests.integration_settings import PLATFORM
-from tests.integration_tests.releases import CURRENT_RELEASE, IS_UBUNTU
+from tests.integration_tests.releases import CURRENT_RELEASE, IS_UBUNTU, MANTIC
 from tests.integration_tests.util import (
     get_feature_flag_value,
+    verify_clean_boot,
     verify_clean_log,
 )
 
 DEB822_SOURCES_FILE = "/etc/apt/sources.list.d/ubuntu.sources"
 ORIG_SOURCES_FILE = "/etc/apt/sources.list"
+GET_TEMPDIR = "python3 -c 'import tempfile;print(tempfile.mkdtemp());'"
 
 USER_DATA = """\
 #cloud-config
@@ -47,9 +49,10 @@ apt:
     deb-src $SECURITY $RELEASE-security multiverse
   sources:
     test_keyserver:
-      keyid: 110E21D8B0E2A1F0243AF6820856F197B892ACEA
+      keyid: 1BC30F715A3B861247A81A5E55FE7C8C0165013E
       keyserver: keyserver.ubuntu.com
-      source: "deb http://ppa.launchpad.net/canonical-kernel-team/ppa/ubuntu $RELEASE main"
+      # Hard-code noble as devel releases may not see new packages for some time
+      source: "deb http://ppa.launchpad.net/curtin-dev/daily/ubuntu noble main"
     test_ppa:
       keyid: 441614D8
       keyserver: keyserver.ubuntu.com
@@ -122,7 +125,7 @@ EXPECTED_REGEXES = [
     r"deb-src http://badsecurity.ubuntu.com/ubuntu [a-z]+-security multiverse",
 ]
 
-TEST_KEYSERVER_KEY = "110E 21D8 B0E2 A1F0 243A  F682 0856 F197 B892 ACEA"
+TEST_KEYSERVER_KEY = "1BC3 0F71 5A3B 8612 47A8  1A5E 55FE 7C8C 0165 013E"
 TEST_PPA_KEY = "3552 C902 B4DD F7BD 3842  1821 015D 28D7 4416 14D8"
 TEST_KEY = "1FF0 D853 5EF7 E719 E5C8  1B9C 083D 06FB E4D3 04DF"
 TEST_SIGNED_BY_KEY = "A2EB 2DEC 0BD7 519B 7B38  BE38 376A 290E C806 8B11"
@@ -135,15 +138,26 @@ class TestApt:
         """Return all keys in /etc/apt/trusted.gpg.d/ and /etc/apt/trusted.gpg
         in human readable format. Mimics the output of apt-key finger
         """
-        list_cmd = " ".join(gpg.GPG_LIST) + " "
+        class_client.execute("mkdir /root/tmpdir && chmod &00 /root/tmpdir")
+        GPG_LIST = [
+            "gpg",
+            "--no-options",
+            "--with-fingerprint",
+            "--homedir /root/tmpdir",
+            "--no-default-keyring",
+            "--list-keys",
+            "--keyring",
+        ]
+
+        list_cmd = " ".join(GPG_LIST) + " "
         keys = class_client.execute(list_cmd + cc_apt_configure.APT_LOCAL_KEYS)
-        print(keys)
         files = class_client.execute(
             "ls " + cc_apt_configure.APT_TRUSTED_GPG_DIR
-        )
+        ).stdout
         for file in files.split():
             path = cc_apt_configure.APT_TRUSTED_GPG_DIR + file
-            keys += class_client.execute(list_cmd + path) or ""
+            keys += class_client.execute(list_cmd + path).stdout
+        class_client.execute("gpgconf --homedir /root/tmpdir --kill all")
         return keys
 
     def test_sources_list(self, class_client: IntegrationInstance):
@@ -176,7 +190,7 @@ class TestApt:
                 CURRENT_RELEASE.series
             )
         )
-        if CURRENT_RELEASE.series < "mantic":
+        if CURRENT_RELEASE < MANTIC:
             ppa_path += ".list"
         else:
             ppa_path += ".sources"
@@ -202,8 +216,10 @@ class TestApt:
         )
         assert path_contents == source
 
+        temp = class_client.execute(GET_TEMPDIR)
         key = class_client.execute(
-            "gpg --no-default-keyring --with-fingerprint --list-keys "
+            f"gpg --no-options --homedir {temp} --no-default-keyring "
+            "--with-fingerprint --list-keys "
             "--keyring /etc/apt/cloud-init.gpg.d/test_signed_by.gpg"
         )
 
@@ -235,7 +251,7 @@ class TestApt:
         )
 
         assert (
-            "http://ppa.launchpad.net/canonical-kernel-team/ppa/ubuntu"
+            "http://ppa.launchpad.net/curtin-dev/daily/ubuntu"
             in test_keyserver_contents
         )
 
@@ -336,6 +352,23 @@ class TestDefaults:
             assert 3 == sources_list.count(sec_deb_line)
             assert 3 == sources_list.count(sec_src_deb_line)
 
+    def test_no_duplicate_apt_sources(self, class_client: IntegrationInstance):
+        r = class_client.execute("apt-get update", use_sudo=True)
+        assert not re.match(
+            r"^W: Target Packages .+ is configured multiple times in", r.stderr
+        )
+
+    def test_disabled_apt_sources(self, class_client: IntegrationInstance):
+        feature_deb822 = is_true(
+            get_feature_flag_value(class_client, "APT_DEB822_SOURCE_LIST_FILE")
+        )
+        if feature_deb822:
+
+            assert (
+                cc_apt_configure.UBUNTU_DEFAULT_APT_SOURCES_LIST.strip()
+                == class_client.read_from_file(ORIG_SOURCES_FILE)
+            )
+
 
 DEFAULT_DATA_WITH_URI = _DEFAULT_DATA.format(
     uri='uri: "http://something.random.invalid/ubuntu"'
@@ -418,14 +451,13 @@ def test_apt_proxy(client: IntegrationInstance):
 
 INSTALL_ANY_MISSING_RECOMMENDED_DEPENDENCIES = """\
 #cloud-config
-bootcmd:
-    - apt-get remove gpg -y
 apt:
   sources:
     test_keyserver:
-      keyid: 110E21D8B0E2A1F0243AF6820856F197B892ACEA
+      keyid: 1BC30F715A3B861247A81A5E55FE7C8C0165013E
       keyserver: keyserver.ubuntu.com
-      source: "deb http://ppa.launchpad.net/canonical-kernel-team/ppa/ubuntu $RELEASE main"
+      # Hard-code noble as devel releases may not see new packages for some time
+      source: "deb http://ppa.launchpad.net/curtin-dev/daily/ubuntu noble main"
     test_ppa:
       keyid: 441614D8
       keyserver: keyserver.ubuntu.com
@@ -434,14 +466,29 @@ apt:
 
 
 RE_GPG_SW_PROPERTIES_INSTALLED = (
-    r"install"
-    r" (gnupg software-properties-common|software-properties-common gnupg)"
+    r"install', '(gnupg', 'software-properties-common|"
+    r"software-properties-common', 'gnupg)"
 )
+
+REMOVE_GPG_USERDATA = """
+#cloud-config
+runcmd:
+  - DEBIAN_FRONTEND=noninteractive apt-get remove gpg -y
+"""
 
 
 @pytest.mark.skipif(not IS_UBUNTU, reason="Apt usage")
-@pytest.mark.user_data(INSTALL_ANY_MISSING_RECOMMENDED_DEPENDENCIES)
-def test_install_missing_deps(client: IntegrationInstance):
-    log = client.read_from_file("/var/log/cloud-init.log")
-    verify_clean_log(log)
-    assert re.search(RE_GPG_SW_PROPERTIES_INSTALLED, log)
+def test_install_missing_deps(session_cloud: IntegrationCloud):
+    # Two stage install: First stage:  remove gpg noninteractively from image
+    instance1 = session_cloud.launch(user_data=REMOVE_GPG_USERDATA)
+    snapshot_id = instance1.snapshot()
+    instance1.destroy()
+    # Second stage: provide active apt user-data which will install missing gpg
+    with session_cloud.launch(
+        user_data=INSTALL_ANY_MISSING_RECOMMENDED_DEPENDENCIES,
+        launch_kwargs={"image_id": snapshot_id},
+    ) as minimal_client:
+        log = minimal_client.read_from_file("/var/log/cloud-init.log")
+        verify_clean_log(log)
+        verify_clean_boot(minimal_client)
+        assert re.search(RE_GPG_SW_PROPERTIES_INSTALLED, log)

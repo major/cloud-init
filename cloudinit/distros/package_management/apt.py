@@ -3,6 +3,7 @@ import fcntl
 import functools
 import logging
 import os
+import re
 import time
 from typing import Any, Iterable, List, Mapping, Optional, Sequence, cast
 
@@ -11,7 +12,7 @@ from cloudinit.distros.package_management.package_manager import (
     PackageManager,
     UninstalledPackages,
 )
-from cloudinit.settings import PER_INSTANCE
+from cloudinit.settings import PER_ALWAYS, PER_INSTANCE
 
 LOG = logging.getLogger(__name__)
 
@@ -83,16 +84,15 @@ class Apt(PackageManager):
     ):
         super().__init__(runner)
         if apt_get_command is None:
-            apt_get_command = APT_GET_COMMAND
+            self.apt_get_command = APT_GET_COMMAND
         if apt_get_upgrade_subcommand is None:
             apt_get_upgrade_subcommand = "dist-upgrade"
         self.apt_command = tuple(apt_get_wrapper_command) + tuple(
-            apt_get_command
+            self.apt_get_command
         )
 
         self.apt_get_upgrade_subcommand = apt_get_upgrade_subcommand
-        self.environment = os.environ.copy()
-        self.environment["DEBIAN_FRONTEND"] = "noninteractive"
+        self.environment = {"DEBIAN_FRONTEND": "noninteractive"}
 
     @classmethod
     def from_config(cls, runner: helpers.Runners, cfg: Mapping) -> "Apt":
@@ -105,12 +105,15 @@ class Apt(PackageManager):
             apt_get_upgrade_subcommand=cfg.get("apt_get_upgrade_subcommand"),
         )
 
-    def update_package_sources(self):
+    def available(self) -> bool:
+        return bool(subp.which(self.apt_get_command[0]))
+
+    def update_package_sources(self, *, force=False):
         self.runner.run(
             "update-sources",
             self.run_package_command,
             ["update"],
-            freq=PER_INSTANCE,
+            freq=PER_ALWAYS if force else PER_INSTANCE,
         )
 
     @functools.lru_cache(maxsize=1)
@@ -124,7 +127,18 @@ class Apt(PackageManager):
         return set(resp.splitlines())
 
     def get_unavailable_packages(self, pkglist: Iterable[str]):
-        return [pkg for pkg in pkglist if pkg not in self.get_all_packages()]
+        # Packages ending with `-` signify to apt to not install a transitive
+        # dependency.
+        # Packages ending with '^' signify to apt to install a Task.
+        # Anything after "/" refers to a target release
+        # "=" allows specifying a specific version
+        # Strip all off when checking for availability
+        return [
+            pkg
+            for pkg in pkglist
+            if re.split("/|=", pkg)[0].rstrip("-^")
+            not in self.get_all_packages()
+        ]
 
     def install_packages(self, pkglist: Iterable) -> UninstalledPackages:
         self.update_package_sources()
@@ -132,11 +146,12 @@ class Apt(PackageManager):
         unavailable = self.get_unavailable_packages(
             [x.split("=")[0] for x in pkglist]
         )
-        LOG.debug(
-            "The following packages were not found by APT so APT will "
-            "not attempt to install them: %s",
-            unavailable,
-        )
+        if unavailable:
+            LOG.debug(
+                "The following packages were not found by APT so APT will "
+                "not attempt to install them: %s",
+                unavailable,
+            )
         to_install = [p for p in pkglist if p not in unavailable]
         if to_install:
             self.run_package_command("install", pkgs=to_install)
@@ -159,22 +174,19 @@ class Apt(PackageManager):
         full_command.extend(pkglist)
 
         self._wait_for_apt_command(
-            short_cmd=command,
             subp_kwargs={
                 "args": full_command,
-                "env": self.environment,
+                "update_env": self.environment,
                 "capture": False,
             },
         )
 
-    def _apt_lock_available(self, lock_files=None):
+    def _apt_lock_available(self):
         """Determines if another process holds any apt locks.
 
         If all locks are clear, return True else False.
         """
-        if lock_files is None:
-            lock_files = APT_LOCK_FILES
-        for lock in lock_files:
+        for lock in APT_LOCK_FILES:
             if not os.path.exists(lock):
                 # Only wait for lock files that already exist
                 continue
@@ -186,29 +198,21 @@ class Apt(PackageManager):
         return True
 
     def _wait_for_apt_command(
-        self, short_cmd, subp_kwargs, timeout=APT_LOCK_WAIT_TIMEOUT
+        self, subp_kwargs, timeout=APT_LOCK_WAIT_TIMEOUT
     ):
         """Wait for apt install to complete.
 
-        short_cmd: Name of command like "upgrade" or "install"
         subp_kwargs: kwargs to pass to subp
         """
-        start_time = time.time()
+        start_time = time.monotonic()
         LOG.debug("Waiting for APT lock")
-        while time.time() - start_time < timeout:
+        while time.monotonic() - start_time < timeout:
             if not self._apt_lock_available():
                 time.sleep(1)
                 continue
             LOG.debug("APT lock available")
             try:
-                # Allow the output of this to flow outwards (not be captured)
-                log_msg = f'apt-{short_cmd} [{" ".join(subp_kwargs["args"])}]'
-                return util.log_time(
-                    logfunc=LOG.debug,
-                    msg=log_msg,
-                    func=subp.subp,
-                    kwargs=subp_kwargs,
-                )
+                return subp.subp(**subp_kwargs)
             except subp.ProcessExecutionError:
                 # Even though we have already waited for the apt lock to be
                 # available, it is possible that the lock was acquired by

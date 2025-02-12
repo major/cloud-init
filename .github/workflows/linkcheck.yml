@@ -1,28 +1,22 @@
-name: linkcheck in CI
-
+name: scheduled-linkcheck
 on:
-  push:
-    branches:
-      - main
-  pull_request: {}
-  workflow_dispatch:
-    inputs:
-      failOnError:
-        description: 'Fail job on link check error'
-        required: false
-        default: 'false'
+  schedule:
+    - cron: '3 14 * * *'
+concurrency:
+  group: 'ci-${{ github.workflow }}-${{ github.ref }}'
+  cancel-in-progress: true
 
 jobs:
   linkcheck:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     continue-on-error: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.failOnError == 'true') }}
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3.0.0
+        uses: actions/checkout@v4
 
       - name: "Install Python 3.10"
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10.8'
 
@@ -37,6 +31,8 @@ jobs:
           broken_count=$(grep -c "broken" output.txt)
           if [[ $broken_count -ge 5 ]]; then
             echo "Too many broken links detected: $broken_count"
+            broken_matches=$(grep "broken" output.txt)
+            echo "Broken links \n$broken_matches"
             exit 1
           else
             echo "Number of broken links is below threshold: $broken_count"

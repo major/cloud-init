@@ -20,6 +20,7 @@ from cloudinit.sources import DataSourceOpenStack as ds
 from cloudinit.sources import convert_vendordata
 from cloudinit.sources.helpers import openstack
 from tests.unittests import helpers as test_helpers
+from tests.unittests import util as test_util
 from tests.unittests.helpers import mock
 
 BASE_URL = "http://169.254.169.254"
@@ -91,14 +92,14 @@ def _register_uris(version, ec2_files, ec2_meta, os_files, *, responses_mock):
 
     def match_ec2_url(uri, headers):
         path = uri.path.strip("/")
-        if len(path) == 0:
+        if not path:
             return (200, headers, "\n".join(EC2_VERSIONS))
         path = uri.path.lstrip("/")
         if path in ec2_files:
             return (200, headers, ec2_files.get(path))
         if path == "latest/meta-data/":
             buf = StringIO()
-            for (k, v) in ec2_meta.items():
+            for k, v in ec2_meta.items():
                 if isinstance(v, (list, tuple)):
                     buf.write("%s/" % (k))
                 else:
@@ -136,7 +137,7 @@ def _register_uris(version, ec2_files, ec2_meta, os_files, *, responses_mock):
 
     responses_mock.add_callback(
         responses.GET,
-        re.compile(r"http://169.254.169.254/.*"),
+        re.compile(r"http://(169.254.169.254|\[fe80::a9fe:a9fe\])/.*"),
         callback=get_request_callback,
     )
 
@@ -315,8 +316,6 @@ class TestOpenStackDataSource(test_helpers.ResponsesTestCase):
         self.assertEqual(EC2_META, ds_os.ec2_metadata)
         self.assertEqual(USER_DATA, ds_os.userdata_raw)
         self.assertEqual(2, len(ds_os.files))
-        self.assertEqual(VENDOR_DATA, ds_os.vendordata_pure)
-        self.assertEqual(VENDOR_DATA2, ds_os.vendordata2_pure)
         self.assertIsNone(ds_os.vendordata_raw)
         m_dhcp.assert_not_called()
 
@@ -324,6 +323,7 @@ class TestOpenStackDataSource(test_helpers.ResponsesTestCase):
     @test_helpers.mock.patch(
         "cloudinit.net.ephemeral.maybe_perform_dhcp_discovery"
     )
+    @pytest.mark.usefixtures("disable_netdev_info")
     def test_local_datasource(self, m_dhcp, m_net):
         """OpenStackLocal calls EphemeralDHCPNetwork and gets instance data."""
         _register_uris(
@@ -338,16 +338,14 @@ class TestOpenStackDataSource(test_helpers.ResponsesTestCase):
         ds_os_local = ds.DataSourceOpenStackLocal(
             settings.CFG_BUILTIN, distro, helpers.Paths({"run_dir": self.tmp})
         )
-        ds_os_local._fallback_interface = "eth9"  # Monkey patch for dhcp
-        m_dhcp.return_value = [
-            {
-                "interface": "eth9",
-                "fixed-address": "192.168.2.9",
-                "routers": "192.168.2.1",
-                "subnet-mask": "255.255.255.0",
-                "broadcast-address": "192.168.2.255",
-            }
-        ]
+        distro.fallback_interface = "eth9"  # Monkey patch for dhcp
+        m_dhcp.return_value = {
+            "interface": "eth9",
+            "fixed-address": "192.168.2.9",
+            "routers": "192.168.2.1",
+            "subnet-mask": "255.255.255.0",
+            "broadcast-address": "192.168.2.255",
+        }
 
         self.assertIsNone(ds_os_local.version)
         with test_helpers.mock.patch.object(
@@ -364,8 +362,6 @@ class TestOpenStackDataSource(test_helpers.ResponsesTestCase):
         self.assertEqual(EC2_META, ds_os_local.ec2_metadata)
         self.assertEqual(USER_DATA, ds_os_local.userdata_raw)
         self.assertEqual(2, len(ds_os_local.files))
-        self.assertEqual(VENDOR_DATA, ds_os_local.vendordata_pure)
-        self.assertEqual(VENDOR_DATA2, ds_os_local.vendordata2_pure)
         self.assertIsNone(ds_os_local.vendordata_raw)
         m_dhcp.assert_called_with(distro, "eth9", None)
 
@@ -390,10 +386,10 @@ class TestOpenStackDataSource(test_helpers.ResponsesTestCase):
             found = ds_os.get_data()
         self.assertFalse(found)
         self.assertIsNone(ds_os.version)
-        self.assertIn(
-            "InvalidMetaDataException: Broken metadata address"
-            " http://169.254.169.25",
+        self.assertRegex(
             self.logs.getvalue(),
+            r"InvalidMetaDataException: Broken metadata address"
+            r" http://(169.254.169.254|\[fe80::a9fe:a9fe\])",
         )
 
     def test_no_datasource(self):
@@ -508,7 +504,9 @@ class TestOpenStackDataSource(test_helpers.ResponsesTestCase):
             responses_mock=self.responses,
         )
         ds_os = ds.DataSourceOpenStack(
-            settings.CFG_BUILTIN, None, helpers.Paths({"run_dir": self.tmp})
+            settings.CFG_BUILTIN,
+            test_util.MockDistro(),
+            helpers.Paths({"run_dir": self.tmp}),
         )
         crawled_data = ds_os._crawl_metadata()
         self.assertEqual(UNSET, ds_os.ec2_metadata)
@@ -687,6 +685,27 @@ class TestDetectOpenStack(test_helpers.CiTestCase):
         self.assertTrue(
             self._fake_ds().ds_detect(),
             "Expected ds_detect == True on Huawei Cloud VM",
+        )
+
+    @test_helpers.mock.patch(MOCK_PATH + "dmi.read_dmi_data")
+    def test_ds_detect_samsung_cloud_platform_chassis_asset_tag(
+        self, m_dmi, m_is_x86
+    ):
+        """Return True on OpenStack reporting
+        Samsung Cloud Platform VM asset-tag."""
+        m_is_x86.return_value = True
+
+        def fake_asset_tag_dmi_read(dmi_key):
+            if dmi_key == "system-product-name":
+                return "c7.large.2"  # No match
+            if dmi_key == "chassis-asset-tag":
+                return "Samsung Cloud Platform"
+            assert False, "Unexpected dmi read of %s" % dmi_key
+
+        m_dmi.side_effect = fake_asset_tag_dmi_read
+        self.assertTrue(
+            self._fake_ds().ds_detect(),
+            "Expected ds_detect == True on Samsung Cloud Platform VM",
         )
 
     @test_helpers.mock.patch(MOCK_PATH + "dmi.read_dmi_data")

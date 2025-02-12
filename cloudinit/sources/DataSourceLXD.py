@@ -112,6 +112,7 @@ class SocketHTTPConnection(HTTPConnection):
     def __init__(self, socket_path):
         super().__init__("localhost")
         self.socket_path = socket_path
+        self.sock = None
 
     def connect(self):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -130,6 +131,13 @@ class SocketConnectionPool(HTTPConnectionPool):
 class LXDSocketAdapter(HTTPAdapter):
     def get_connection(self, url, proxies=None):
         return SocketConnectionPool(LXD_SOCKET_PATH)
+
+    # Fix for requests 2.32.2+:
+    # https://github.com/psf/requests/pull/6710
+    def get_connection_with_tls_context(
+        self, request, verify, proxies=None, cert=None
+    ):
+        return self.get_connection(request.url, proxies)
 
 
 def _raw_instance_data_to_dict(metadata_type: str, metadata_value) -> dict:
@@ -166,16 +174,17 @@ class DataSourceLXD(sources.DataSource):
     dsname = "LXD"
 
     _network_config: Union[Dict, str] = sources.UNSET
-    _crawled_metadata: Union[Dict, str] = sources.UNSET
+    _crawled_metadata: Optional[Union[Dict, str]] = sources.UNSET
 
-    sensitive_metadata_keys: Tuple[
-        str, ...
-    ] = sources.DataSource.sensitive_metadata_keys + (
-        "user.meta-data",
-        "user.vendor-data",
-        "user.user-data",
-        "cloud-init.user-data",
-        "cloud-init.vendor-data",
+    sensitive_metadata_keys: Tuple[str, ...] = (
+        sources.DataSource.sensitive_metadata_keys
+        + (
+            "user.meta-data",
+            "user.vendor-data",
+            "user.user-data",
+            "cloud-init.user-data",
+            "cloud-init.vendor-data",
+        )
     )
 
     skip_hotplug_detect = True
@@ -187,27 +196,25 @@ class DataSourceLXD(sources.DataSource):
     @staticmethod
     def ds_detect() -> bool:
         """Check platform environment to report if this datasource may run."""
-        return is_platform_viable()
+        if not os.path.exists(LXD_SOCKET_PATH):
+            LOG.warning("%s does not exist.", LXD_SOCKET_PATH)
+            return False
+        elif not stat.S_ISSOCK(os.lstat(LXD_SOCKET_PATH).st_mode):
+            LOG.warning("%s is not a socket", LXD_SOCKET_PATH)
+            return False
+        return True
 
     def _get_data(self) -> bool:
         """Crawl LXD socket API instance data and return True on success"""
-        self._crawled_metadata = util.log_time(
-            logfunc=LOG.debug,
-            msg="Crawl of metadata service",
-            func=read_metadata,
-        )
+        self._crawled_metadata = read_metadata()
         self.metadata = _raw_instance_data_to_dict(
             "meta-data", self._crawled_metadata.get("meta-data")
         )
         config = self._crawled_metadata.get("config", {})
         user_metadata = config.get("user.meta-data", {})
         if user_metadata:
-            user_metadata = _raw_instance_data_to_dict(
-                "user.meta-data", user_metadata
-            )
-        if not isinstance(self.metadata, dict):
-            self.metadata = util.mergemanydict(
-                [util.load_yaml(self.metadata), user_metadata]
+            self.metadata.update(
+                _raw_instance_data_to_dict("user.meta-data", user_metadata)
             )
         if "user-data" in self._crawled_metadata:
             self.userdata_raw = self._crawled_metadata["user-data"]
@@ -267,13 +274,6 @@ class DataSourceLXD(sources.DataSource):
         return cast(dict, self._network_config)
 
 
-def is_platform_viable() -> bool:
-    """Return True when this platform appears to have an LXD socket."""
-    if os.path.exists(LXD_SOCKET_PATH):
-        return stat.S_ISSOCK(os.lstat(LXD_SOCKET_PATH).st_mode)
-    return False
-
-
 def _get_json_response(
     session: requests.Session, url: str, do_raise: bool = True
 ):
@@ -283,7 +283,7 @@ def _get_json_response(
             "Skipping %s on [HTTP:%d]:%s",
             url,
             url_response.status_code,
-            url_response.text,
+            url_response.content.decode("utf-8"),
         )
         return {}
     try:
@@ -292,7 +292,7 @@ def _get_json_response(
         raise sources.InvalidMetaDataException(
             "Unable to process LXD config at {url}."
             " Expected JSON but found: {resp}".format(
-                url=url, resp=url_response.text
+                url=url, resp=url_response.content.decode("utf-8")
             )
         ) from exc
 
@@ -320,7 +320,7 @@ def _do_request(
             "Invalid HTTP response [{code}] from {route}: {resp}".format(
                 code=response.status_code,
                 route=url,
-                resp=response.text,
+                resp=response.content.decode("utf-8"),
             )
         )
     return response
@@ -331,7 +331,7 @@ class MetaDataKeys(Flag):
     CONFIG = auto()
     DEVICES = auto()
     META_DATA = auto()
-    ALL = CONFIG | DEVICES | META_DATA
+    ALL = CONFIG | DEVICES | META_DATA  # pylint: disable=E1131
 
 
 class _MetaDataReader:
@@ -363,12 +363,13 @@ class _MetaDataReader:
             config_route_response = _do_request(
                 session, config_route_url, do_raise=False
             )
+            response_text = config_route_response.content.decode("utf-8")
             if not config_route_response.ok:
                 LOG.debug(
                     "Skipping %s on [HTTP:%d]:%s",
                     config_route_url,
                     config_route_response.status_code,
-                    config_route_response.text,
+                    response_text,
                 )
                 continue
 
@@ -376,16 +377,14 @@ class _MetaDataReader:
             # Leave raw data values/format unchanged to represent it in
             # instance-data.json for cloud-init query or jinja template
             # use.
-            config["config"][cfg_key] = config_route_response.text
+            config["config"][cfg_key] = response_text
             # Promote common CONFIG_KEY_ALIASES to top-level keys.
             if cfg_key in CONFIG_KEY_ALIASES:
                 # Due to sort of config_routes, promote cloud-init.*
                 # aliases before user.*. This allows user.* keys to act as
                 # fallback config on old LXD, with new cloud-init images.
                 if CONFIG_KEY_ALIASES[cfg_key] not in config:
-                    config[
-                        CONFIG_KEY_ALIASES[cfg_key]
-                    ] = config_route_response.text
+                    config[CONFIG_KEY_ALIASES[cfg_key]] = response_text
                 else:
                     LOG.warning(
                         "Ignoring LXD config %s in favor of %s value.",
@@ -403,7 +402,9 @@ class _MetaDataReader:
                 md_route = url_helper.combine_url(
                     self._version_url, "meta-data"
                 )
-                md["meta-data"] = _do_request(session, md_route).text
+                md["meta-data"] = _do_request(
+                    session, md_route
+                ).content.decode("utf-8")
             if MetaDataKeys.CONFIG in metadata_keys:
                 md.update(self._process_config(session))
             if MetaDataKeys.DEVICES in metadata_keys:
@@ -425,7 +426,7 @@ def read_metadata(
     when the LXD configuration setting `security.devlxd` is true.
 
     When `security.devlxd` is false, no /dev/lxd/socket file exists. This
-    datasource will return False from `is_platform_viable` in that case.
+    datasource will return False from `ds_detect` in that case.
 
     Perform a GET of <LXD_SOCKET_API_VERSION>/config` and walk all `user.*`
     configuration keys, storing all keys and values under a dict key

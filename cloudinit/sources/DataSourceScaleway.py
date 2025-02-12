@@ -19,7 +19,7 @@ from requests.exceptions import ConnectionError
 from urllib3.connection import HTTPConnection
 from urllib3.poolmanager import PoolManager
 
-from cloudinit import dmi, net, sources, url_helper, util
+from cloudinit import dmi, performance, sources, url_helper, util
 from cloudinit.event import EventScope, EventType
 from cloudinit.net.dhcp import NoDHCPLeaseError
 from cloudinit.net.ephemeral import EphemeralDHCPv4, EphemeralIPv6Network
@@ -78,13 +78,13 @@ def query_data_api_once(api_address, timeout, requests_session):
             api_address,
             data=None,
             timeout=timeout,
-            # It's the caller's responsability to recall this function in case
+            # It's the caller's responsibility to recall this function in case
             # of exception. Don't let url_helper.readurl() retry by itself.
             retries=0,
             session=requests_session,
             # If the error is a HTTP/404 or a ConnectionError, go into raise
             # block below and don't bother retrying.
-            exception_cb=lambda _, exc: exc.code != 404
+            exception_cb=lambda exc: exc.code != 404
             and (
                 not isinstance(exc.cause, requests.exceptions.ConnectionError)
             ),
@@ -171,9 +171,9 @@ class DataSourceScaleway(sources.DataSource):
         self.retries = int(self.ds_cfg.get("retries", DEF_MD_RETRIES))
         self.timeout = int(self.ds_cfg.get("timeout", DEF_MD_TIMEOUT))
         self.max_wait = int(self.ds_cfg.get("max_wait", DEF_MD_MAX_WAIT))
-        self._fallback_interface = None
         self._network_config = sources.UNSET
         self.metadata_urls = DS_BASE_URLS
+        self.metadata_url = None
         self.userdata_url = None
         self.vendordata_url = None
         self.ephemeral_fixed_address = None
@@ -181,12 +181,26 @@ class DataSourceScaleway(sources.DataSource):
         if "metadata_urls" in self.ds_cfg.keys():
             self.metadata_urls += self.ds_cfg["metadata_urls"]
 
+    def _unpickle(self, ci_pkl_version: int) -> None:
+        super()._unpickle(ci_pkl_version)
+        attr_defaults = {
+            "ephemeral_fixed_address": None,
+            "has_ipv4": True,
+            "max_wait": DEF_MD_MAX_WAIT,
+            "metadata_urls": DS_BASE_URLS,
+            "userdata_url": None,
+            "vendordata_url": None,
+        }
+        for attr in attr_defaults:
+            if not hasattr(self, attr):
+                setattr(self, attr, attr_defaults[attr])
+
     def _set_metadata_url(self, urls):
         """
         Define metadata_url based upon api-metadata URL availability.
         """
 
-        start_time = time.time()
+        start_time = time.monotonic()
         avail_url, _ = url_helper.wait_for_url(
             urls=urls,
             max_wait=self.max_wait,
@@ -203,7 +217,7 @@ class DataSourceScaleway(sources.DataSource):
             LOG.debug(
                 "Unable to reach api-metadata at %s after %s seconds",
                 urls,
-                int(time.time() - start_time),
+                int(time.monotonic() - start_time),
             )
             raise ConnectionError
 
@@ -241,34 +255,7 @@ class DataSourceScaleway(sources.DataSource):
         if "scaleway" in cmdline:
             return True
 
-    def _set_urls_on_ip_version(self, proto, urls):
-
-        if proto not in ["ipv4", "ipv6"]:
-            LOG.debug("Invalid IP version : %s", proto)
-            return []
-
-        filtered_urls = []
-        for url in urls:
-            # Numeric IPs
-            address = urlparse(url).netloc
-            if address[0] == "[":
-                address = address[1:-1]
-            addr_proto = socket.getaddrinfo(
-                address, None, proto=socket.IPPROTO_TCP
-            )[0][0]
-            if addr_proto == socket.AF_INET and proto == "ipv4":
-                filtered_urls += [url]
-                continue
-            elif addr_proto == socket.AF_INET6 and proto == "ipv6":
-                filtered_urls += [url]
-                continue
-
-        return filtered_urls
-
     def _get_data(self):
-
-        if self._fallback_interface is None:
-            self._fallback_interface = net.find_fallback_nic()
 
         # The DataSource uses EventType.BOOT so we are called more than once.
         # Try to crawl metadata on IPv4 first and set has_ipv4 to False if we
@@ -280,20 +267,14 @@ class DataSourceScaleway(sources.DataSource):
                 # it will only reach timeout on VMs with only IPv6 addresses.
                 with EphemeralDHCPv4(
                     self.distro,
-                    self._fallback_interface,
+                    self.distro.fallback_interface,
                 ) as ipv4:
-                    util.log_time(
-                        logfunc=LOG.debug,
-                        msg="Set api-metadata URL depending on "
-                        "IPv4 availability",
-                        func=self._set_metadata_url,
-                        args=(self.metadata_urls,),
-                    )
-                    util.log_time(
-                        logfunc=LOG.debug,
-                        msg="Crawl of metadata service",
-                        func=self._crawl_metadata,
-                    )
+                    with performance.Timed(
+                        "Setting api-metadata URL "
+                        "depending on IPv4 availability"
+                    ):
+                        self._set_metadata_url(self.metadata_urls)
+                    self._crawl_metadata()
                     self.ephemeral_fixed_address = ipv4["fixed-address"]
                     self.metadata["net_in_use"] = "ipv4"
             except (
@@ -311,22 +292,16 @@ class DataSourceScaleway(sources.DataSource):
             try:
                 with EphemeralIPv6Network(
                     self.distro,
-                    self._fallback_interface,
+                    self.distro.fallback_interface,
                 ):
-                    util.log_time(
-                        logfunc=LOG.debug,
-                        msg="Set api-metadata URL depending on "
+                    with performance.Timed(
+                        "Setting api-metadata URL depending on "
                         "IPv6 availability",
-                        func=self._set_metadata_url,
-                        args=(self.metadata_urls,),
-                    )
-                    util.log_time(
-                        logfunc=LOG.debug,
-                        msg="Crawl of metadata service",
-                        func=self._crawl_metadata,
-                    )
+                    ):
+                        self._set_metadata_url(self.metadata_urls)
+                    self._crawl_metadata()
                     self.metadata["net_in_use"] = "ipv6"
-            except (ConnectionError):
+            except ConnectionError:
                 return False
         return True
 
@@ -346,9 +321,6 @@ class DataSourceScaleway(sources.DataSource):
         if self._network_config != sources.UNSET:
             return self._network_config
 
-        if self._fallback_interface is None:
-            self._fallback_interface = net.find_fallback_nic()
-
         if self.metadata["private_ip"] is None:
             # New method of network configuration
 
@@ -359,9 +331,15 @@ class DataSourceScaleway(sources.DataSource):
                 if ip["address"] == self.ephemeral_fixed_address:
                     ip_cfg["dhcp4"] = True
                     # Force addition of a route to the metadata API
-                    ip_cfg["routes"] = [
-                        {"to": "169.254.42.42/32", "via": "62.210.0.1"}
-                    ]
+                    route = {
+                        "on-link": True,
+                        "to": "169.254.42.42/32",
+                        "via": "62.210.0.1",
+                    }
+                    if "routes" in ip_cfg.keys():
+                        ip_cfg["routes"] += [route]
+                    else:
+                        ip_cfg["routes"] = [route]
                 else:
                     if "addresses" in ip_cfg.keys():
                         ip_cfg["addresses"] += (
@@ -377,13 +355,13 @@ class DataSourceScaleway(sources.DataSource):
                             ip_cfg["routes"] += [route]
                         else:
                             ip_cfg["routes"] = [route]
-            netcfg[self._fallback_interface] = ip_cfg
+            netcfg[self.distro.fallback_interface] = ip_cfg
             self._network_config = {"version": 2, "ethernets": netcfg}
         else:
             # Kept for backward compatibility
             netcfg = {
                 "type": "physical",
-                "name": "%s" % self._fallback_interface,
+                "name": "%s" % self.distro.fallback_interface,
             }
             subnets = [{"type": "dhcp4"}]
             if self.metadata["ipv6"]:

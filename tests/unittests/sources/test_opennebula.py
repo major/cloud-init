@@ -43,7 +43,7 @@ DS_PATH = "cloudinit.sources.DataSourceOpenNebula"
 
 class TestOpenNebulaDataSource(CiTestCase):
     parsed_user = None
-    allowed_subp = ["bash"]
+    allowed_subp = ["bash", "sh"]
 
     def setUp(self):
         super(TestOpenNebulaDataSource, self).setUp()
@@ -67,7 +67,7 @@ class TestOpenNebulaDataSource(CiTestCase):
 
     def tearDown(self):
         ds.switch_user_cmd = self.switch_user_cmd_real
-        super(TestOpenNebulaDataSource, self).tearDown()
+        super().tearDown()
 
     def test_get_data_non_contextdisk(self):
         orig_find_devs_with = util.find_devs_with
@@ -1023,7 +1023,7 @@ class TestOpenNebulaNetwork(unittest.TestCase):
 
 
 class TestParseShellConfig:
-    @pytest.mark.allow_subp_for("bash")
+    @pytest.mark.allow_subp_for("bash", "sh")
     def test_no_seconds(self):
         cfg = "\n".join(["foo=bar", "SECONDS=2", "xx=foo"])
         # we could test 'sleep 2', but that would make the test run slower.

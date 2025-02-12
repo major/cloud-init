@@ -4,7 +4,7 @@
 #
 # This file is part of cloud-init. See LICENSE file for license information.
 
-"""Define 'clean' utility and handler as part of cloud-init commandline."""
+"""Define 'clean' utility and handler as part of cloud-init command line."""
 
 import argparse
 import glob
@@ -13,12 +13,13 @@ import sys
 
 from cloudinit import settings
 from cloudinit.distros import uses_systemd
+from cloudinit.log import log_util
+from cloudinit.net.netplan import CLOUDINIT_NETPLAN_FILE
 from cloudinit.stages import Init
 from cloudinit.subp import ProcessExecutionError, runparts, subp
 from cloudinit.util import (
     del_dir,
     del_file,
-    error,
     get_config_logfiles,
     is_link,
     write_file,
@@ -26,7 +27,7 @@ from cloudinit.util import (
 
 ETC_MACHINE_ID = "/etc/machine-id"
 GEN_NET_CONFIG_FILES = [
-    "/etc/netplan/50-cloud-init.yaml",
+    CLOUDINIT_NETPLAN_FILE,
     "/etc/NetworkManager/conf.d/99-cloud-init.conf",
     "/etc/NetworkManager/conf.d/30-cloud-init-ip6-addr-gen-mode.conf",
     "/etc/NetworkManager/system-connections/cloud-init-*.nmconnection",
@@ -105,9 +106,10 @@ def get_parser(parser=None):
     return parser
 
 
-def remove_artifacts(remove_logs, remove_seed=False, remove_config=None):
+def remove_artifacts(init, remove_logs, remove_seed=False, remove_config=None):
     """Helper which removes artifacts dir and optionally log files.
 
+    @param: init: Init object to use
     @param: remove_logs: Boolean. Set True to delete the cloud_dir path. False
         preserves them.
     @param: remove_seed: Boolean. Set True to also delete seed subdir in
@@ -116,7 +118,6 @@ def remove_artifacts(remove_logs, remove_seed=False, remove_config=None):
         Can be any of: all, network, ssh_config.
     @returns: 0 on success, 1 otherwise.
     """
-    init = Init(ds_deps=[])
     init.read_cfg()
     if remove_logs:
         for log_file in get_config_logfiles(init.cfg):
@@ -143,12 +144,12 @@ def remove_artifacts(remove_logs, remove_seed=False, remove_config=None):
             else:
                 del_file(path)
         except OSError as e:
-            error("Could not remove {0}: {1}".format(path, str(e)))
+            log_util.error("Could not remove {0}: {1}".format(path, str(e)))
             return 1
     try:
         runparts(settings.CLEAN_RUNPARTS_DIR)
     except Exception as e:
-        error(
+        log_util.error(
             f"Failure during run-parts of {settings.CLEAN_RUNPARTS_DIR}: {e}"
         )
         return 1
@@ -157,8 +158,9 @@ def remove_artifacts(remove_logs, remove_seed=False, remove_config=None):
 
 def handle_clean_args(name, args):
     """Handle calls to 'cloud-init clean' as a subcommand."""
+    init = Init(ds_deps=[])
     exit_code = remove_artifacts(
-        args.remove_logs, args.remove_seed, args.remove_config
+        init, args.remove_logs, args.remove_seed, args.remove_config
     )
     if args.machine_id:
         if uses_systemd():
@@ -168,11 +170,13 @@ def handle_clean_args(name, args):
             # Non-systemd like FreeBSD regen machine-id when file is absent
             del_file(ETC_MACHINE_ID)
     if exit_code == 0 and args.reboot:
-        cmd = ["shutdown", "-r", "now"]
+        cmd = init.distro.shutdown_command(
+            mode="reboot", delay="now", message=None
+        )
         try:
             subp(cmd, capture=False)
         except ProcessExecutionError as e:
-            error(
+            log_util.error(
                 'Could not reboot this system using "{0}": {1}'.format(
                     cmd, str(e)
                 )

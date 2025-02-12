@@ -1,4 +1,4 @@
-""" Integration test for LP #1835584
+"""Integration test for LP #1835584
 
 Upstream linux kernels prior to 4.15 provide DMI product_uuid in uppercase.
 More recent kernels switched to lowercase for DMI product_uuid. Azure
@@ -25,6 +25,7 @@ seeing only one semaphore creation log entry of type:
 
 https://bugs.launchpad.net/cloud-init/+bug/1835584
 """
+
 import re
 
 import pytest
@@ -91,10 +92,5 @@ def test_azure_kernel_upgrade_case_insensitive_uuid(
             )
         }
     ) as instance:
-        # We can't use setup_image fixture here because we want to avoid
-        # taking a snapshot or cleaning the booted machine after cloud-init
-        # upgrade.
-        instance.install_new_cloud_init(
-            source, take_snapshot=False, clean=False
-        )
+        instance.install_new_cloud_init(source, clean=False)
         _check_iid_insensitive_across_kernel_upgrade(instance)

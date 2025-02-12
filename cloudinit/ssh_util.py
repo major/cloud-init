@@ -12,7 +12,7 @@ import pwd
 from contextlib import suppress
 from typing import List, Sequence, Tuple
 
-from cloudinit import subp, util
+from cloudinit import lifecycle, subp, util
 
 LOG = logging.getLogger(__name__)
 
@@ -27,14 +27,13 @@ DEF_SSHD_CFG = "/etc/ssh/sshd_config"
 # refer to the keytype struct of OpenSSH in the same file, to see
 # if the position of the sigonly flag has been moved.
 #
-# dsa, rsa, ecdsa and ed25519 are added for legacy, as they are valid
+# rsa, ecdsa and ed25519 are added for legacy, as they are valid
 # public keys in some old distros. They can possibly be removed
 # in the future when support for the older distros is dropped
 #
 # When updating the list, also update the _is_printable_key list in
 # cloudinit/config/cc_ssh_authkey_fingerprints.py
 VALID_KEY_TYPES = (
-    "dsa",
     "rsa",
     "ecdsa",
     "ed25519",
@@ -48,8 +47,6 @@ VALID_KEY_TYPES = (
     "sk-ecdsa-sha2-nistp256@openssh.com",
     "sk-ssh-ed25519-cert-v01@openssh.com",
     "sk-ssh-ed25519@openssh.com",
-    "ssh-dss-cert-v01@openssh.com",
-    "ssh-dss",
     "ssh-ed25519-cert-v01@openssh.com",
     "ssh-ed25519",
     "ssh-rsa-cert-v01@openssh.com",
@@ -106,7 +103,7 @@ class AuthKeyLineParser:
      (because of the size of the public key encoding) up to a limit of 8 kilo-
      bytes, which permits DSA keys up to 8 kilobits and RSA keys up to 16
      kilobits.  You don't want to type them in; instead, copy the
-     identity.pub, id_dsa.pub, or the id_rsa.pub file and edit it.
+     identity.pub or the id_rsa.pub file and edit it.
 
      sshd enforces a minimum RSA key modulus size for protocol 1 and protocol
      2 keys of 768 bits.
@@ -193,7 +190,7 @@ def parse_authorized_keys(fnames):
     for fname in fnames:
         try:
             if os.path.isfile(fname):
-                lines = util.load_file(fname).splitlines()
+                lines = util.load_text_file(fname).splitlines()
                 for line in lines:
                     contents.append(parser.parse(line))
         except (IOError, OSError):
@@ -204,7 +201,7 @@ def parse_authorized_keys(fnames):
 
 def update_authorized_keys(old_entries, keys):
     to_add = list([k for k in keys if k.valid()])
-    for i in range(0, len(old_entries)):
+    for i in range(len(old_entries)):
         ent = old_entries[i]
         if not ent.valid():
             continue
@@ -315,7 +312,7 @@ def check_permissions(username, current_path, full_path, is_file, strictmodes):
 
     # 3. no write permission (w) is given to group and world users (022)
     # Group and world user can still have +rx.
-    if strictmodes and parent_permission & 0o022 != 0:
+    if strictmodes and (parent_permission & 0o022):
         LOG.debug(
             "Path %s in %s must not give write"
             "permission to group or world users. Ignoring key.",
@@ -504,7 +501,7 @@ class SshdConfigLine:
 def parse_ssh_config(fname) -> List[SshdConfigLine]:
     if not os.path.isfile(fname):
         return []
-    return parse_ssh_config_lines(util.load_file(fname).splitlines())
+    return parse_ssh_config_lines(util.load_text_file(fname).splitlines())
 
 
 def parse_ssh_config_lines(lines) -> List[SshdConfigLine]:
@@ -549,10 +546,9 @@ def parse_ssh_config_map(fname):
 def _includes_dconf(fname: str) -> bool:
     if not os.path.isfile(fname):
         return False
-    with open(fname, "r") as f:
-        for line in f:
-            if line.startswith(f"Include {fname}.d/*.conf"):
-                return True
+    for line in util.load_text_file(fname).splitlines():
+        if line.startswith(f"Include {fname}.d/*.conf"):
+            return True
     return False
 
 
@@ -596,7 +592,7 @@ def update_ssh_config_lines(lines, updates):
     # Keywords are case-insensitive and arguments are case-sensitive
     casemap = dict([(k.lower(), k) for k in updates.keys()])
 
-    for (i, line) in enumerate(lines, start=1):
+    for i, line in enumerate(lines, start=1):
         if not line.key:
             continue
         if line.key in casemap:
@@ -664,7 +660,7 @@ def get_opensshd_version():
 
 
 def get_opensshd_upstream_version():
-    """Get the upstream version of the OpenSSH sshd dameon on the system.
+    """Get the upstream version of the OpenSSH sshd daemon on the system.
 
     This will NOT include the portable number, so if the Ubuntu version looks
     like `1.2p1 Ubuntu-1ubuntu0.1`, then this function would return
@@ -674,7 +670,7 @@ def get_opensshd_upstream_version():
     upstream_version = "9.0"
     full_version = get_opensshd_version()
     if full_version is None:
-        return util.Version.from_str(upstream_version)
+        return lifecycle.Version.from_str(upstream_version)
     if "p" in full_version:
         upstream_version = full_version[: full_version.find("p")]
     elif " " in full_version:
@@ -682,7 +678,7 @@ def get_opensshd_upstream_version():
     else:
         upstream_version = full_version
     try:
-        upstream_version = util.Version.from_str(upstream_version)
+        upstream_version = lifecycle.Version.from_str(upstream_version)
         return upstream_version
     except (ValueError, TypeError):
         LOG.warning("Could not parse sshd version: %s", upstream_version)

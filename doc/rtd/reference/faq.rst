@@ -15,69 +15,15 @@ Having trouble? We would like to help!
 - Find a bug? Check out the :ref:`reporting_bugs` topic to find out how to
   report one
 
-Why did ``cloud-init`` never complete?
-======================================
+``autoinstall``
+===============
 
-To check if ``cloud-init`` is running still, run:
+Other projects, such as `Subiquity autoinstaller`_, use cloud-init to implement
+a subset of their features and have a YAML configuration format which combines
+``cloud-init``'s cloud-config with additional keys.
 
-.. code-block:: shell-session
-
-   cloud-init status
-
-To wait for ``cloud-init`` to complete, run:
-
-.. code-block:: shell-session
-
-   cloud-init status --wait
-
-There are a number of reasons that ``cloud-init`` might never complete. This
-list is not exhaustive, but attempts to enumerate potential causes:
-
-External reasons
-----------------
-
-- Failed dependent services in the boot.
-- Bugs in the kernel or drivers.
-- Bugs in external userspace tools that are called by ``cloud-init``.
-
-Internal reasons
-----------------
-
-- A command in ``bootcmd`` or ``runcmd`` that never completes (e.g., running
-  :command:`cloud-init status --wait` will wait forever on itself and never
-  complete).
-- Non-standard configurations that disable timeouts or set extremely high
-  values ("never" is used in a loose sense here).
-
-Failing to complete on ``systemd``
-----------------------------------
-
-``Cloud-init`` consists of multiple services on ``systemd``. If a service
-that ``cloud-init`` depends on stalls, ``cloud-init`` will not continue.
-If reporting a bug related to ``cloud-init`` failing to complete on
-``systemd``, please make sure to include the following logs.
-
-.. code-block:: shell-session
-
-   systemd-analyze critical-chain cloud-init.target
-   journalctl --boot=-1
-   systemctl --failed
-
-``autoinstall``, ``preruncmd``, ``postruncmd``
-==============================================
-
-Since ``cloud-init`` ignores top level user data ``cloud-config`` keys, other
-projects such as `Juju`_ and `Subiquity autoinstaller`_ use a YAML-formatted
-config that combines ``cloud-init``'s user data cloud-config YAML format with
-their custom YAML keys. Since ``cloud-init`` ignores unused top level keys,
-these combined YAML configurations may be valid ``cloud-config`` files,
-however keys such as ``autoinstall``, ``preruncmd``, and ``postruncmd`` are
-not used by ``cloud-init`` to configure anything.
-
-Please direct bugs and questions about other projects that use ``cloud-init``
-to their respective support channels. For Subiquity autoinstaller that is via
-IRC (``#ubuntu-server`` on Libera) or Discourse. For Juju support see their
-`discourse page`_.
+If you are an autoinstall user, please direct questions to their IRC channel
+(``#ubuntu-server`` on Libera).
 
 Can I use cloud-init as a library?
 ==================================
@@ -131,8 +77,6 @@ Whitepapers:
 
 .. _mailing list: https://launchpad.net/~cloud-init
 .. _IRC channel on Libera: https://kiwiirc.com/nextclient/irc.libera.chat/cloud-init
-.. _Juju: https://ubuntu.com/blog/topics/juju
-.. _discourse page: https://discourse.charmhub.io
 .. _do: https://github.com/canonical/ubuntu-pro-client/blob/9b46480b9e4b88e918bac5ced0d4b8edb3cbbeab/lib/auto_attach.py#L35
 
 .. _cloud-init - The Good Parts: https://www.youtube.com/watch?v=2_m6EUo6VOI
@@ -154,5 +98,3 @@ Whitepapers:
 .. _cloud-init Summit 2018: https://powersj.io/post/cloud-init-summit18/
 .. _cloud-init Summit 2017: https://powersj.io/post/cloud-init-summit17/
 .. _Subiquity autoinstaller: https://ubuntu.com/server/docs/install/autoinstall
-.. _juju_project: https://discourse.charmhub.io/t/model-config-cloudinit-userdata/512
-.. _discourse page: https://discourse.charmhub.io

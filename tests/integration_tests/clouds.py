@@ -7,7 +7,7 @@ import re
 import string
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from typing import Type
+from typing import Optional, Type
 from uuid import UUID
 
 from pycloudlib import (
@@ -21,7 +21,7 @@ from pycloudlib import (
     Openstack,
     Qemu,
 )
-from pycloudlib.cloud import BaseCloud, ImageType
+from pycloudlib.cloud import ImageType
 from pycloudlib.ec2.instance import EC2Instance
 from pycloudlib.lxd.cloud import _BaseLXD
 from pycloudlib.lxd.instance import BaseInstance, LXDInstance
@@ -55,7 +55,6 @@ def _get_ubuntu_series() -> list:
 
 class IntegrationCloud(ABC):
     datasource: str
-    cloud_instance: BaseCloud
 
     def __init__(
         self,
@@ -64,9 +63,9 @@ class IntegrationCloud(ABC):
     ):
         self._image_type = image_type
         self.settings = settings
-        self.cloud_instance: BaseCloud = self._get_cloud_instance()
+        self.cloud_instance = self._get_cloud_instance()
         self.initial_image_id = self._get_initial_image()
-        self.snapshot_id = None
+        self.snapshot_id: Optional[str] = None
 
     @property
     def image_id(self):
@@ -133,6 +132,10 @@ class IntegrationCloud(ABC):
             "user_data": user_data,
             "username": DISTRO_TO_USERNAME[CURRENT_RELEASE.os],
         }
+        if self.settings.INSTANCE_TYPE:
+            default_launch_kwargs["instance_type"] = (
+                self.settings.INSTANCE_TYPE
+            )
         launch_kwargs = {**default_launch_kwargs, **launch_kwargs}
         display_launch_kwargs = deepcopy(launch_kwargs)
         if display_launch_kwargs.get("user_data") is not None:
@@ -200,7 +203,7 @@ class IntegrationCloud(ABC):
 class Ec2Cloud(IntegrationCloud):
     datasource = "ec2"
 
-    def _get_cloud_instance(self):
+    def _get_cloud_instance(self) -> EC2:
         return EC2(tag="ec2-integration-test")
 
     def _get_initial_image(self, **kwargs) -> str:
@@ -209,22 +212,18 @@ class Ec2Cloud(IntegrationCloud):
         )
 
     def _perform_launch(
-        self, *, launch_kwargs, wait=True, **kwargs
+        self, *, launch_kwargs, wait=True, enable_ipv6=True, **kwargs
     ) -> EC2Instance:
         """Use a dual-stack VPC for cloud-init integration testing."""
-        if "vpc" not in launch_kwargs:
-            launch_kwargs["vpc"] = self.cloud_instance.get_or_create_vpc(
-                name="ec2-cloud-init-integration"
-            )
-        # Enable IPv6 metadata at http://[fd00:ec2::254]
-        if "Ipv6AddressCount" not in launch_kwargs:
-            launch_kwargs["Ipv6AddressCount"] = 1
-        if "MetadataOptions" not in launch_kwargs:
-            launch_kwargs["MetadataOptions"] = {}
-        if "HttpProtocolIpv6" not in launch_kwargs["MetadataOptions"]:
-            launch_kwargs["MetadataOptions"] = {"HttpProtocolIpv6": "enabled"}
+        if enable_ipv6:
+            if "vpc" not in launch_kwargs:
+                launch_kwargs["vpc"] = self.cloud_instance.get_or_create_vpc(
+                    name="ec2-cloud-init-integration"
+                )
 
-        pycloudlib_instance = self.cloud_instance.launch(**launch_kwargs)
+        pycloudlib_instance = self.cloud_instance.launch(
+            enable_ipv6=enable_ipv6, **launch_kwargs
+        )
         self._maybe_wait(pycloudlib_instance, wait)
         return pycloudlib_instance
 
@@ -232,7 +231,7 @@ class Ec2Cloud(IntegrationCloud):
 class GceCloud(IntegrationCloud):
     datasource = "gce"
 
-    def _get_cloud_instance(self):
+    def _get_cloud_instance(self) -> GCE:
         return GCE(
             tag="gce-integration-test",
         )
@@ -247,7 +246,7 @@ class AzureCloud(IntegrationCloud):
     datasource = "azure"
     cloud_instance: Azure
 
-    def _get_cloud_instance(self):
+    def _get_cloud_instance(self) -> Azure:
         return Azure(tag="azure-integration-test")
 
     def _get_initial_image(self, **kwargs) -> str:
@@ -269,7 +268,7 @@ class AzureCloud(IntegrationCloud):
 class OciCloud(IntegrationCloud):
     datasource = "oci"
 
-    def _get_cloud_instance(self):
+    def _get_cloud_instance(self) -> OCI:
         return OCI(
             tag="oci-integration-test",
         )
@@ -280,11 +279,12 @@ class _LxdIntegrationCloud(IntegrationCloud):
     instance_tag: str
     cloud_instance: _BaseLXD
 
-    def _get_cloud_instance(self):
-        return self.pycloudlib_instance_cls(tag=self.instance_tag)
+    def _get_initial_image(self, **kwargs) -> str:
+        return super()._get_initial_image(
+            image_type=self._image_type, **kwargs
+        )
 
-    @staticmethod
-    def _get_or_set_profile_list(release):
+    def _get_or_set_profile_list(self, release):
         return None
 
     @staticmethod
@@ -295,6 +295,10 @@ class _LxdIntegrationCloud(IntegrationCloud):
             (
                 os.path.join(cloudinit_path, "..", "templates"),
                 "/etc/cloud/templates",
+            ),
+            (
+                os.path.join(cloudinit_path, "..", "doc", "module-docs"),
+                "/usr/share/doc/cloud-init/module-docs",
             ),
         ]
         for n, (source_path, target_path) in enumerate(mounts):
@@ -330,7 +334,9 @@ class _LxdIntegrationCloud(IntegrationCloud):
         except KeyError:
             profile_list = self._get_or_set_profile_list(release)
 
-        prefix = datetime.datetime.utcnow().strftime("cloudinit-%m%d-%H%M%S")
+        prefix = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "cloudinit-%m%d-%H%M%S"
+        )
         default_name = prefix + "".join(
             random.choices(string.ascii_lowercase + string.digits, k=8)
         )
@@ -355,15 +361,21 @@ class LxdContainerCloud(_LxdIntegrationCloud):
     pycloudlib_instance_cls = LXDContainer
     instance_tag = "lxd-container-integration-test"
 
+    def _get_cloud_instance(self) -> LXDContainer:
+        return self.pycloudlib_instance_cls(tag=self.instance_tag)
+
 
 class LxdVmCloud(_LxdIntegrationCloud):
     datasource = "lxd_vm"
     cloud_instance: LXDVirtualMachine
     pycloudlib_instance_cls = LXDVirtualMachine
     instance_tag = "lxd-vm-integration-test"
-    _profile_list = None
+    _profile_list: list = []
 
-    def _get_or_set_profile_list(self, release):
+    def _get_cloud_instance(self) -> LXDVirtualMachine:
+        return self.pycloudlib_instance_cls(tag=self.instance_tag)
+
+    def _get_or_set_profile_list(self, release) -> list:
         if self._profile_list:
             return self._profile_list
         self._profile_list = self.cloud_instance.build_necessary_profiles(

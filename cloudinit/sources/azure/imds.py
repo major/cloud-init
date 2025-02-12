@@ -3,7 +3,8 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
 import logging
-from time import time
+import uuid
+from time import monotonic
 from typing import Dict, Optional, Type, Union
 
 import requests
@@ -17,13 +18,20 @@ LOG = logging.getLogger(__name__)
 IMDS_URL = "http://169.254.169.254/metadata"
 
 
+def headers_cb(_url):
+    return {
+        "Metadata": "true",
+        "x-ms-client-request-id": str(uuid.uuid4()),
+    }
+
+
 class ReadUrlRetryHandler:
     """Manager for readurl retry behavior using exception_callback().
 
     :param logging_backoff: Backoff to limit logging.
     :param max_connection_errors: Number of connection errors to retry on.
     :param retry_codes: Set of http codes to retry on.
-    :param retry_deadline: Optional time()-based deadline to retry until.
+    :param retry_deadline: Optional monotonic()-based deadline to retry until.
     """
 
     def __init__(
@@ -47,7 +55,7 @@ class ReadUrlRetryHandler:
         self._request_count = 0
         self._last_error: Union[None, Type, int] = None
 
-    def exception_callback(self, req_args, exception) -> bool:
+    def exception_callback(self, exception) -> bool:
         self._request_count += 1
         if not isinstance(exception, UrlError):
             report_diagnostic_event(
@@ -58,7 +66,10 @@ class ReadUrlRetryHandler:
             return False
 
         log = True
-        if self.retry_deadline is not None and time() >= self.retry_deadline:
+        if (
+            self.retry_deadline is not None
+            and monotonic() >= self.retry_deadline
+        ):
             retry = False
         else:
             retry = True
@@ -104,7 +115,7 @@ class ReadUrlRetryHandler:
             report_diagnostic_event(
                 "Polling IMDS failed attempt %d with exception: %r"
                 % (self._request_count, exception),
-                logger_func=LOG.info,
+                logger_func=LOG.warning,
             )
         return retry
 
@@ -129,7 +140,7 @@ def _fetch_url(
         response = readurl(
             url,
             exception_cb=retry_handler.exception_callback,
-            headers={"Metadata": "true"},
+            headers_cb=headers_cb,
             infinite=True,
             log_req_resp=log_response,
             timeout=timeout,
@@ -160,7 +171,7 @@ def _fetch_metadata(
     metadata = _fetch_url(url, retry_handler=retry_handler)
 
     try:
-        return util.load_json(metadata)
+        return util.load_json(metadata.decode("utf-8"))
     except ValueError as error:
         report_diagnostic_event(
             "Failed to parse metadata from IMDS: %s" % error,
@@ -221,7 +232,7 @@ def fetch_reprovision_data() -> bytes:
     response = readurl(
         url,
         exception_cb=handler.exception_callback,
-        headers={"Metadata": "true"},
+        headers_cb=headers_cb,
         infinite=True,
         log_req_resp=False,
         timeout=30,

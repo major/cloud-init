@@ -10,9 +10,14 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
 import copy
+import logging
 
 from cloudinit.distros import PREFERRED_NTP_CLIENTS, debian
 from cloudinit.distros.package_management.snap import Snap
+from cloudinit.net import activators
+from cloudinit.net.netplan import CLOUDINIT_NETPLAN_FILE
+
+LOG = logging.getLogger(__name__)
 
 
 class Distro(debian.Distro):
@@ -21,7 +26,7 @@ class Distro(debian.Distro):
         # Ubuntu specific network cfg locations
         self.network_conf_fn = {
             "eni": "/etc/network/interfaces.d/50-cloud-init.cfg",
-            "netplan": "/etc/netplan/50-cloud-init.yaml",
+            "netplan": CLOUDINIT_NETPLAN_FILE,
         }
         self.renderer_configs = {
             "eni": {
@@ -39,7 +44,8 @@ class Distro(debian.Distro):
 
     def package_command(self, command, args=None, pkgs=None):
         super().package_command(command, args, pkgs)
-        self.snap.upgrade_packages()
+        if self.snap.available():
+            self.snap.upgrade_packages()
 
     @property
     def preferred_ntp_clients(self):
@@ -47,3 +53,12 @@ class Distro(debian.Distro):
         if not self._preferred_ntp_clients:
             self._preferred_ntp_clients = copy.deepcopy(PREFERRED_NTP_CLIENTS)
         return self._preferred_ntp_clients
+
+    def wait_for_network(self) -> None:
+        """Ensure that cloud-init's network service has network connectivity"""
+        try:
+            self.network_activator.wait_for_network()
+        except activators.NoActivatorException:
+            LOG.error("Failed to wait for network. No network activator found")
+        except Exception as e:
+            LOG.error("Failed to wait for network: %s", e)

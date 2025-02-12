@@ -14,8 +14,6 @@ from typing import Dict, List, Optional, Tuple, Union
 
 LOG = logging.getLogger(__name__)
 
-MAC_RE = r"""([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}"""
-
 
 class Ifstate:
     """
@@ -102,8 +100,9 @@ class Ifconfig:
         """
         ifindex = 0
         ifs_by_mac = defaultdict(list)
+        dev = None
         for line in text.splitlines():
-            if len(line) == 0:
+            if not line:
                 continue
             if line[0] not in ("\t", " "):
                 # We hit the start of a device block in the ifconfig output
@@ -118,6 +117,11 @@ class Ifconfig:
                 dev = Ifstate(curif)
                 dev.index = ifindex
                 self._ifs_by_name[curif] = dev
+
+            if not dev:
+                # This shouldn't happen with normal ifconfig output, but
+                # if it does, ensure we don't Traceback
+                continue
 
             toks = line.lower().strip().split()
 
@@ -204,14 +208,12 @@ class Ifconfig:
         if "/" in toks[1]:
             ip = IPv4Interface(toks[1])
             netmask = str(ip.netmask)
-            if "broadcast" in toks:
-                broadcast = toks[toks.index("broadcast") + 1]
         else:
             netmask = str(IPv4Address(int(toks[3], 0)))
-            if "broadcast" in toks:
-                broadcast = toks[toks.index("broadcast") + 1]
             ip = IPv4Interface("%s/%s" % (toks[1], netmask))
 
+        if "broadcast" in toks:
+            broadcast = toks[toks.index("broadcast") + 1]
         prefixlen = ip.with_prefixlen.split("/")[1]
         return (
             str(ip.ip),

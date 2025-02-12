@@ -17,9 +17,11 @@ import base64
 import logging
 import os
 import re
-from xml.dom import minidom
+from xml.dom import minidom  # nosec B408
 
-from cloudinit import safeyaml, sources, subp, util
+import yaml
+
+from cloudinit import sources, subp, util
 
 LOG = logging.getLogger(__name__)
 
@@ -76,7 +78,7 @@ class DataSourceOVF(sources.DataSource):
                 found.append(name)
 
         # There was no OVF transports found
-        if len(found) == 0:
+        if not found:
             return False
 
         if "seedfrom" in md and md["seedfrom"]:
@@ -90,7 +92,7 @@ class DataSourceOVF(sources.DataSource):
                 LOG.debug("Seed from %s not supported by %s", seedfrom, self)
                 return False
 
-            (md_seed, ud, vd) = util.read_seeded(seedfrom, timeout=None)
+            (md_seed, ud, vd, _) = util.read_seeded(seedfrom, timeout=None)
             LOG.debug("Using seeded cache data from %s", seedfrom)
 
             md = util.mergemanydict([md, md_seed])
@@ -175,7 +177,7 @@ def get_ovf_env(dirname):
         full_fn = os.path.join(dirname, fname)
         if os.path.isfile(full_fn):
             try:
-                contents = util.load_file(full_fn)
+                contents = util.load_text_file(full_fn)
                 return (fname, contents)
             except Exception:
                 util.logexc(LOG, "Failed loading ovf file %s", full_fn)
@@ -320,10 +322,11 @@ def transport_vmware_guestinfo():
         # If the first attempt at getting the data was with vmtoolsd, then
         # no second attempt is made.
         if vmtoolsd and rpctool == vmtoolsd:
-            # The fallback failed, log the error.
-            util.logexc(
-                LOG, "vmtoolsd failed to get guestinfo.ovfEnv: %s", error
-            )
+            # The fallback failed and exit code is not 1, log the error.
+            if error.exit_code != 1:
+                util.logexc(
+                    LOG, "vmtoolsd failed to get guestinfo.ovfEnv: %s", error
+                )
             return None
 
         if not vmtoolsd:
@@ -334,10 +337,11 @@ def transport_vmware_guestinfo():
             LOG.info("fallback to vmtoolsd")
             return query_guestinfo(vmtoolsd, exec_vmtoolsd)
         except subp.ProcessExecutionError as error:
-            # The fallback failed, log the error.
-            util.logexc(
-                LOG, "vmtoolsd failed to get guestinfo.ovfEnv: %s", error
-            )
+            # The fallback failed and exit code is not 1, log the error.
+            if error.exit_code != 1:
+                util.logexc(
+                    LOG, "vmtoolsd failed to get guestinfo.ovfEnv: %s", error
+                )
 
     return None
 
@@ -353,7 +357,7 @@ def find_child(node, filter_func):
 
 
 def get_properties(contents):
-    dom = minidom.parseString(contents)
+    dom = minidom.parseString(contents)  # nosec B318
     if dom.documentElement.localName != "Environment":
         raise XmlError("No Environment Node")
 
@@ -368,7 +372,7 @@ def get_properties(contents):
         dom.documentElement, lambda n: n.localName == "PropertySection"
     )
 
-    if len(propSections) == 0:
+    if not propSections:
         raise XmlError("No 'PropertySection's")
 
     props = {}
@@ -408,4 +412,4 @@ def safeload_yaml_or_dict(data):
     """
     if not data:
         return {}
-    return safeyaml.load(data)
+    return yaml.safe_load(data)

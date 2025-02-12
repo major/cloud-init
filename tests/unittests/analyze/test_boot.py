@@ -28,17 +28,12 @@ class TestDistroChecker(CiTestCase):
 
 
 class TestSystemCtlReader:
-    @pytest.mark.parametrize(
-        "args",
-        [
-            pytest.param(["dummyProperty"], id="invalid_property"),
-            pytest.param(
-                ["dummyProperty", "dummyParameter"], id="invalid_parameter"
-            ),
-        ],
-    )
-    def test_systemctl_invalid(self, args):
-        reader = SystemctlReader(*args)
+    def test_systemctl_invalid(self, mocker):
+        mocker.patch(
+            "cloudinit.analyze.show.subp.subp",
+            return_value=("", "something_invalid"),
+        )
+        reader = SystemctlReader("dont", "care")
         with pytest.raises(RuntimeError):
             reader.parse_epoch_as_float()
 
@@ -130,7 +125,7 @@ class TestAnalyzeBoot:
                 "Your Linux distro or container does not support this "
                 "functionality.\nYou must be running a Kernel "
                 "Telemetry supported distro.\nPlease check "
-                "https://cloudinit.readthedocs.io/en/latest/topics"
+                "https://docs.cloud-init.io/en/latest/topics"
                 "/analyze.html for more information on supported "
                 "distros.\n"
             )

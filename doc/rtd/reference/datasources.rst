@@ -4,14 +4,14 @@ Datasources
 ***********
 
 Datasources are sources of configuration data for ``cloud-init`` that typically
-come from the user (i.e., user data) or come from the cloud that created the
-configuration drive (i.e., metadata). Typical user data includes files,
-YAML, and shell scripts whereas typical metadata includes server name,
+come from the user (i.e., user-data) or come from the cloud that created the
+configuration drive (i.e., meta-data). Typical user-data includes files,
+YAML, and shell scripts whereas typical meta-data includes server name,
 instance id, display name, and other cloud specific details.
 
-Any metadata processed by ``cloud-init``'s datasources is persisted as
+Any meta-data processed by ``cloud-init``'s datasources is persisted as
 :file:`/run/cloud-init/instance-data.json`. ``Cloud-init`` provides tooling to
-quickly introspect some of that data. See :ref:`instance_metadata` for more
+quickly introspect some of that data. See :ref:`instance-data` for more
 information.
 
 How to configure which datasource to use
@@ -26,7 +26,7 @@ There are exceptions, however, when the :ref:`datasource does not
 identify<datasource_ironic>` itself to ``cloud-init``. For these
 exceptions, one can override datasource detection either by configuring a
 single datasource in the :ref:`datasource_list<base_config_datasource_list>`,
-or by using :ref:`kernel commandline arguments<kernel_datasource_override>`.
+or by using :ref:`kernel command line arguments<kernel_datasource_override>`.
 
 .. _datasources_supported:
 
@@ -43,6 +43,7 @@ The following is a list of documentation for each supported datasource:
    datasources/altcloud.rst
    datasources/ec2.rst
    datasources/azure.rst
+   datasources/cloudcix.rst
    datasources/cloudsigma.rst
    datasources/cloudstack.rst
    datasources/configdrive.rst
@@ -54,15 +55,17 @@ The following is a list of documentation for each supported datasource:
    datasources/lxd.rst
    datasources/maas.rst
    datasources/nocloud.rst
+   datasources/none.rst
    datasources/nwcs.rst
    datasources/opennebula.rst
    datasources/openstack.rst
    datasources/oracle.rst
    datasources/ovf.rst
    datasources/rbxcloud.rst
+   datasources/scaleway.rst
    datasources/smartos.rst
    datasources/upcloud.rst
    datasources/vmware.rst
    datasources/vultr.rst
+   datasources/wsl.rst
    datasources/zstack.rst
-

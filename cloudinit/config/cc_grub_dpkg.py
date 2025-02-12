@@ -10,53 +10,21 @@
 
 import logging
 import os
-from textwrap import dedent
 
 from cloudinit import subp, util
 from cloudinit.cloud import Cloud
 from cloudinit.config import Config
-from cloudinit.config.schema import MetaSchema, get_meta_doc
+from cloudinit.config.schema import MetaSchema
 from cloudinit.settings import PER_INSTANCE
 from cloudinit.subp import ProcessExecutionError
 
-MODULE_DESCRIPTION = """\
-Configure which device is used as the target for grub installation. This module
-can be enabled/disabled using the ``enabled`` config key in the ``grub_dpkg``
-config dict. This module automatically selects a disk using ``grub-probe`` if
-no installation device is specified.
-
-The value which is placed into the debconf database is in the format which the
-grub postinstall script expects. Normally, this is a /dev/disk/by-id/ value,
-but we do fallback to the plain disk name if a by-id name is not present.
-
-If this module is executed inside a container, then the debconf database is
-seeded with empty values, and install_devices_empty is set to true.
-"""
-distros = ["ubuntu", "debian"]
 meta: MetaSchema = {
     "id": "cc_grub_dpkg",
-    "name": "Grub Dpkg",
-    "title": "Configure grub debconf installation device",
-    "description": MODULE_DESCRIPTION,
-    "distros": distros,
+    "distros": ["ubuntu", "debian"],
     "frequency": PER_INSTANCE,
-    "examples": [
-        dedent(
-            """\
-            grub_dpkg:
-              enabled: true
-              # BIOS mode (install_devices needs disk)
-              grub-pc/install_devices: /dev/sda
-              grub-pc/install_devices_empty: false
-              # EFI mode (install_devices needs partition)
-              grub-efi/install_devices: /dev/sda
-            """
-        )
-    ],
-    "activate_by_schema_keys": [],
+    "activate_by_schema_keys": ["grub_dpkg", "grub-dpkg"],
 }
 
-__doc__ = get_meta_doc(meta)
 LOG = logging.getLogger(__name__)
 
 
@@ -145,7 +113,7 @@ def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
     if not mycfg:
         mycfg = {}
 
-    enabled = mycfg.get("enabled", True)
+    enabled = mycfg.get("enabled", False)
     if util.is_false(enabled):
         LOG.debug("%s disabled by config grub_dpkg/enabled=%s", name, enabled)
         return

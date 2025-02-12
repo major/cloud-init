@@ -1,7 +1,8 @@
+-r requirements.txt
 # PyPI requirements for cloud-init integration testing
-# https://cloudinit.readthedocs.io/en/latest/topics/integration_tests.html
+# https://docs.cloud-init.io/en/latest/development/integration_tests.html
 #
-pycloudlib>=5.10.0,<1!6
+pycloudlib>=1!10.0.2,<1!11
 
 # Avoid breaking change in `testpaths` treatment forced
 # test/unittests/conftest.py to be loaded by our integration-tests tox env
@@ -11,3 +12,4 @@ pytest!=7.3.2
 
 packaging
 passlib
+coverage==7.2.7  # Last version supported in Python 3.7

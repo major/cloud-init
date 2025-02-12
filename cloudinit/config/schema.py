@@ -5,39 +5,47 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
-import textwrap
 from collections import defaultdict
-from collections.abc import Iterable
+from contextlib import suppress
 from copy import deepcopy
+from enum import Enum
 from errno import EACCES
 from functools import partial
-from itertools import chain
 from typing import (
     TYPE_CHECKING,
     DefaultDict,
     List,
     NamedTuple,
     Optional,
+    Tuple,
     Type,
     Union,
-    cast,
 )
 
 import yaml
 
-from cloudinit import importer, safeyaml
+from cloudinit import features, lifecycle, performance, safeyaml
 from cloudinit.cmd.devel import read_cfg_paths
 from cloudinit.handlers import INCLUSION_TYPES_MAP, type_from_starts_with
+from cloudinit.helpers import Paths
+from cloudinit.log.log_util import error
 from cloudinit.sources import DataSourceNotFoundException
-from cloudinit.util import error, get_modules_from_dir, load_file
+from cloudinit.temp_utils import mkdtemp
+from cloudinit.util import load_text_file, write_file
 
 try:
-    from jsonschema import ValidationError as _ValidationError
-
-    ValidationError = _ValidationError
+    from jsonschema import ValidationError
 except ImportError:
     ValidationError = Exception  # type: ignore
+
+try:
+    from netplan import NetplanParserException, Parser  # type: ignore
+
+    LIBNETPLAN_AVAILABLE = True
+except ImportError:
+    LIBNETPLAN_AVAILABLE = False
 
 
 LOG = logging.getLogger(__name__)
@@ -47,65 +55,16 @@ LOG = logging.getLogger(__name__)
 # If we change the location of versions.schema.json in github, we need
 # to provide an updated PR to
 # https://github.com/SchemaStore/schemastore.
-VERSIONED_USERDATA_SCHEMA_FILE = "versions.schema.cloud-config.json"
-
 # When bumping schema version due to incompatible changes:
 # 1. Add a new schema-cloud-config-v#.json
 # 2. change the USERDATA_SCHEMA_FILE to cloud-init-schema-v#.json
 # 3. Add the new version definition to versions.schema.cloud-config.json
 USERDATA_SCHEMA_FILE = "schema-cloud-config-v1.json"
 NETWORK_CONFIG_V1_SCHEMA_FILE = "schema-network-config-v1.json"
+NETWORK_CONFIG_V2_SCHEMA_FILE = "schema-network-config-v2.json"
 
-SCHEMA_FILES_BY_TYPE = {
-    "cloud-config": {
-        "latest": USERDATA_SCHEMA_FILE,
-    },
-    "network-config": {
-        "latest": NETWORK_CONFIG_V1_SCHEMA_FILE,
-    },
-}
 
-_YAML_MAP = {True: "true", False: "false", None: "null"}
-SCHEMA_DOC_TMPL = """
-{name}
-{title_underbar}
-
-{title}
-
-.. tab-set::
-
-{prefix3}.. tab-item:: Summary
-
-{description}
-
-{prefix6}**Internal name:** ``{id}``
-
-{prefix6}**Module frequency:** {frequency}
-
-{prefix6}**Supported distros:** {distros}
-
-{prefix6}{activate_by_schema_keys}
-
-{prefix3}.. tab-item:: Config schema
-
-{property_doc}
-
-{prefix3}.. tab-item:: Examples
-
-{prefix6}::
-
-{examples}
-"""
-SCHEMA_PROPERTY_HEADER = ""
-SCHEMA_PROPERTY_TMPL = "{prefix}* **{prop_name}:** ({prop_type}){description}"
-SCHEMA_LIST_ITEM_TMPL = (
-    "{prefix}* Each object in **{prop_name}** list supports "
-    "the following keys:"
-)
-SCHEMA_EXAMPLES_HEADER = ""
-SCHEMA_EXAMPLES_SPACER_TEMPLATE = "\n   # --- Example{example_count} ---\n\n"
 DEPRECATED_KEY = "deprecated"
-DEPRECATED_PREFIX = "DEPRECATED: "
 
 # user-data files typically must begin with a leading '#'
 USERDATA_VALID_HEADERS = sorted(
@@ -120,12 +79,8 @@ if TYPE_CHECKING:
     from typing_extensions import NotRequired, TypedDict
 
     class MetaSchema(TypedDict):
-        name: str
         id: str
-        title: str
-        description: str
         distros: typing.List[str]
-        examples: typing.List[str]
         frequency: str
         activate_by_schema_keys: NotRequired[List[str]]
 
@@ -134,7 +89,14 @@ else:
 
 
 class SchemaDeprecationError(ValidationError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        version: str,
+        **kwargs,
+    ):
+        super().__init__(message, **kwargs)
+        self.version: str = version
 
 
 class SchemaProblem(NamedTuple):
@@ -146,6 +108,57 @@ class SchemaProblem(NamedTuple):
 
 
 SchemaProblems = List[SchemaProblem]
+
+
+class SchemaType(Enum):
+    """Supported schema types are either cloud-config or network-config.
+
+    Vendordata and Vendordata2 format adheres to cloud-config schema type.
+    Cloud Metadata is unique schema to each cloud platform and likely will not
+    be represented in this enum.
+    """
+
+    CLOUD_CONFIG = "cloud-config"
+    NETWORK_CONFIG = "network-config"
+    NETWORK_CONFIG_V1 = "network-config-v1"
+    NETWORK_CONFIG_V2 = "network-config-v2"
+
+
+# Placeholders for versioned schema and schema file locations.
+# The "latest" key is used in absence of a requested specific version.
+SCHEMA_FILES_BY_TYPE = {
+    SchemaType.CLOUD_CONFIG: {
+        "latest": USERDATA_SCHEMA_FILE,
+    },
+    SchemaType.NETWORK_CONFIG: {
+        "latest": NETWORK_CONFIG_V2_SCHEMA_FILE,
+    },
+    SchemaType.NETWORK_CONFIG_V1: {
+        "latest": NETWORK_CONFIG_V1_SCHEMA_FILE,
+    },
+    SchemaType.NETWORK_CONFIG_V2: {
+        "latest": NETWORK_CONFIG_V2_SCHEMA_FILE,
+    },
+}
+
+
+class InstanceDataType(Enum):
+    """Types of instance data provided to cloud-init"""
+
+    USERDATA = "user-data"
+    NETWORK_CONFIG = "network-config"
+    VENDORDATA = "vendor-data"
+    VENDOR2DATA = "vendor2-data"
+    # METADATA = "metadata"
+
+    def __str__(self):  # pylint: disable=invalid-str-returned
+        return self.value
+
+
+class InstanceDataPart(NamedTuple):
+    config_type: InstanceDataType
+    schema_type: SchemaType
+    config_path: str
 
 
 class UserDataTypeAndDecodedContent(NamedTuple):
@@ -204,6 +217,10 @@ class SchemaValidationError(ValueError):
 
     def has_errors(self) -> bool:
         return bool(self.schema_errors)
+
+
+class SchemaValidationInvalidHeaderError(SchemaValidationError):
+    """Raised when no valid header is declared in the user-data file."""
 
 
 def is_schema_byte_string(checker, instance):
@@ -298,18 +315,14 @@ def _validator(
 ):
     """Jsonschema validator for `deprecated` items.
 
-    It raises a instance of `error_type` if deprecated that must be handled,
+    It yields an instance of `error_type` if deprecated that must be handled,
     otherwise the instance is consider faulty.
     """
     if deprecated:
         msg = _add_deprecated_changed_or_new_msg(
             schema, annotate=True, filter_key=[filter_key]
         )
-        yield error_type(msg)
-
-
-_validator_deprecated = partial(_validator, filter_key="deprecated")
-_validator_changed = partial(_validator, filter_key="changed")
+        yield error_type(msg, schema.get("deprecated_version", "devel"))
 
 
 def _anyOf(
@@ -447,27 +460,18 @@ def get_jsonschema_validator():
     meta_schema["properties"]["label"] = {"type": "string"}
 
     validator_kwargs = {}
-    if hasattr(Draft4Validator, "TYPE_CHECKER"):  # jsonschema 3.0+
-        meta_schema["additionalProperties"] = False  # Unsupported in 2.6.0
-        type_checker = Draft4Validator.TYPE_CHECKER.redefine(
-            "string", is_schema_byte_string
-        )
-        validator_kwargs = {
-            "type_checker": type_checker,
-        }
-    else:  # jsonschema 2.6 workaround
-        # pylint:disable-next=no-member
-        types = Draft4Validator.DEFAULT_TYPES  # pylint: disable=E1101
-        # Allow bytes as well as string (and disable a spurious unsupported
-        # assignment-operation pylint warning which appears because this
-        # code path isn't written against the latest jsonschema).
-        types["string"] = (str, bytes)  # pylint: disable=E1137
-        validator_kwargs = {"default_types": types}
+    meta_schema["additionalProperties"] = False
+    type_checker = Draft4Validator.TYPE_CHECKER.redefine(
+        "string", is_schema_byte_string
+    )
+    validator_kwargs = {
+        "type_checker": type_checker,
+    }
 
     # Add deprecation handling
     validators = dict(Draft4Validator.VALIDATORS)
-    validators[DEPRECATED_KEY] = _validator_deprecated
-    validators["changed"] = _validator_changed
+    validators[DEPRECATED_KEY] = partial(_validator, filter_key="deprecated")
+    validators["changed"] = partial(_validator, filter_key="changed")
     validators["oneOf"] = _oneOf
     validators["anyOf"] = _anyOf
 
@@ -478,8 +482,7 @@ def get_jsonschema_validator():
         **validator_kwargs,
     )
 
-    # Add deprecation handling
-    def is_valid(self, instance, _schema=None, **__):
+    def is_valid_pre_4_0_0(self, instance, _schema=None, **__):
         """Override version of `is_valid`.
 
         It does ignore instances of `SchemaDeprecationError`.
@@ -492,7 +495,27 @@ def get_jsonschema_validator():
         )
         return next(errors, None) is None
 
-    cloudinitValidator.is_valid = is_valid
+    def is_valid(self, instance, _schema=None, **__):
+        """Override version of `is_valid`.
+
+        It does ignore instances of `SchemaDeprecationError`.
+        """
+        errors = filter(
+            lambda e: not isinstance(  # pylint: disable=W1116
+                e, SchemaDeprecationError
+            ),
+            self.evolve(schema=_schema).iter_errors(instance),
+        )
+        return next(errors, None) is None
+
+    # Add deprecation handling
+    is_valid_fn = is_valid_pre_4_0_0
+    if hasattr(cloudinitValidator, "evolve"):
+        is_valid_fn = is_valid
+
+    # this _could_ be an error, but it's not in this case
+    # https://github.com/python/mypy/issues/2427#issuecomment-1419206807
+    cloudinitValidator.is_valid = is_valid_fn  # type: ignore [method-assign]
 
     return (cloudinitValidator, FormatChecker)
 
@@ -532,15 +555,118 @@ def validate_cloudconfig_metaschema(validator, schema: dict, throw=True):
         )
 
 
+def network_schema_version(network_config: dict) -> Optional[int]:
+    """Return the version of the network schema when present."""
+    if "network" in network_config:
+        return network_config["network"].get("version")
+    return network_config.get("version")
+
+
+def netplan_validate_network_schema(
+    network_config: dict,
+    strict: bool = False,
+    annotate: bool = False,
+    log_details: bool = True,
+) -> bool:
+    """On systems with netplan, validate network_config schema for file
+
+    Leverage NetplanParser for error annotation line, column and detailed
+    errors.
+
+    @param network_config: Dict of network configuration settings validated
+        against
+    @param strict: Boolean, when True raise SchemaValidationErrors instead of
+       logging warnings.
+    @param annotate: Boolean, when True, print original network_config_file
+        content with error annotations
+    @param log_details: Boolean, when True logs details of validation errors.
+       If there are concerns about logging sensitive userdata, this should
+       be set to False.
+
+    @return: True when schema validation was performed. False when not on a
+        system with netplan and netplan python support.
+    @raises: SchemaValidationError when netplan's parser raises
+        NetplanParserExceptions.
+    """
+    if LIBNETPLAN_AVAILABLE:
+        LOG.debug("Validating network-config with netplan API")
+    else:
+        LOG.debug(
+            "Skipping netplan schema validation. No netplan API available"
+        )
+        return False
+    # netplan Parser looks at all *.yaml files in the target directory underA
+    # /etc/netplan. cloud-init should only validate schema of the
+    # network-config it generates, so create a <tmp_dir>/etc/netplan
+    # to validate only our network-config.
+    parse_dir = mkdtemp()
+    netplan_file = os.path.join(parse_dir, "etc/netplan/network-config.yaml")
+
+    # Datasource network config can optionally exclude top-level network key
+    net_cfg = deepcopy(network_config)
+    if "network" not in net_cfg:
+        net_cfg = {"network": net_cfg}
+
+    src_content = safeyaml.dumps(net_cfg)
+    write_file(netplan_file, src_content, mode=0o600)
+
+    parser = Parser()
+    errors = []
+    try:
+        # Parse all netplan *.yaml files.load_yaml_hierarchy looks for nested
+        # etc/netplan subdir under "/".
+        parser.load_yaml_hierarchy(parse_dir)
+    except NetplanParserException as e:
+        errors.append(
+            SchemaProblem(
+                "format-l{line}.c{col}".format(line=e.line, col=e.column),
+                f"Invalid netplan schema. {e.message}",
+            )
+        )
+    if os.path.exists(parse_dir):
+        shutil.rmtree(parse_dir)
+    if errors:
+        if strict:
+            if annotate:
+                # Load YAML marks for annotation
+                _, marks = safeyaml.load_with_marks(src_content)
+                print(
+                    annotated_cloudconfig_file(
+                        src_content,
+                        marks,
+                        schema_errors=errors,
+                    )
+                )
+            raise SchemaValidationError(errors)
+        if log_details:
+            message = _format_schema_problems(
+                errors,
+                prefix=(
+                    f"{SchemaType.NETWORK_CONFIG.value} failed "
+                    "schema validation!\n"
+                ),
+                separator="\n",
+            )
+        else:
+            message = (
+                f"{SchemaType.NETWORK_CONFIG.value} failed schema validation! "
+                "You may run 'sudo cloud-init schema --system' to "
+                "check the details."
+            )
+        LOG.warning(message)
+    return True
+
+
+@performance.timed("Validating schema")
 def validate_cloudconfig_schema(
     config: dict,
     schema: Optional[dict] = None,
-    schema_type: str = "cloud-config",
+    schema_type: SchemaType = SchemaType.CLOUD_CONFIG,
     strict: bool = False,
     strict_metaschema: bool = False,
     log_details: bool = True,
     log_deprecations: bool = False,
-):
+) -> bool:
     """Validate provided config meets the schema definition.
 
     @param config: Dict of cloud configuration settings validated against
@@ -548,8 +674,10 @@ def validate_cloudconfig_schema(
     @param schema: jsonschema dict describing the supported schema definition
        for the cloud config module (config.cc_*). If None, validate against
        global schema.
-    @param schema_type: Optional string. One of: cloud-config, network-config
-       Default: cloud-config.
+    @param schema_type: Optional SchemaType.
+       One of: SchemaType.CLOUD_CONFIG or SchemaType.NETWORK_CONFIG_V1 or
+            SchemaType.NETWORK_CONFIG_V2
+       Default: SchemaType.CLOUD_CONFIG
     @param strict: Boolean, when True raise SchemaValidationErrors instead of
        logging warnings.
     @param strict_metaschema: Boolean, when True validates schema using strict
@@ -562,9 +690,34 @@ def validate_cloudconfig_schema(
     @raises: SchemaValidationError when provided config does not validate
         against the provided schema.
     @raises: RuntimeError when provided config sourced from YAML is not a dict.
-    @raises: ValueError on invalid schema_type not in cloud-config or
-        network_config
+    @raises: ValueError on invalid schema_type not in CLOUD_CONFIG or
+        NETWORK_CONFIG_V1 or NETWORK_CONFIG_V2
     """
+    from cloudinit.net.netplan import available as netplan_available
+
+    if schema_type == SchemaType.NETWORK_CONFIG:
+        network_version = network_schema_version(config)
+        if network_version == 2:
+            schema_type = SchemaType.NETWORK_CONFIG_V2
+        elif network_version == 1:
+            schema_type = SchemaType.NETWORK_CONFIG_V1
+        schema = get_schema(schema_type)
+
+    if schema_type == SchemaType.NETWORK_CONFIG_V2:
+        if netplan_validate_network_schema(
+            network_config=config, strict=strict, log_details=log_details
+        ):
+            # Schema was validated by netplan
+            return True
+        elif netplan_available():
+            # We found no netplan API on netplan system, do not perform schema
+            # validation against cloud-init's network v2 schema because netplan
+            # supports more config keys than in cloud-init's netv2 schema.
+            # This may result in schema warnings for valid netplan config
+            # which would be successfully rendered by netplan but doesn't
+            # adhere to cloud-init's network v2.
+            return False
+
     if schema is None:
         schema = get_schema(schema_type)
     try:
@@ -575,12 +728,13 @@ def validate_cloudconfig_schema(
             )
     except ImportError:
         LOG.debug("Ignoring schema validation. jsonschema is not present")
-        return
+        return False
 
     validator = cloudinitValidator(schema, format_checker=FormatChecker())
 
     errors: SchemaProblems = []
     deprecations: SchemaProblems = []
+    info_deprecations: SchemaProblems = []
     for schema_error in sorted(
         validator.iter_errors(config), key=lambda e: e.path
     ):
@@ -596,37 +750,52 @@ def validate_cloudconfig_schema(
             )
             if prop_match:
                 path = prop_match["name"]
-        problem = (SchemaProblem(path, schema_error.message),)
         if isinstance(
             schema_error, SchemaDeprecationError
         ):  # pylint: disable=W1116
-            deprecations += problem
+            if (
+                schema_error.version == "devel"
+                or lifecycle.should_log_deprecation(
+                    schema_error.version, features.DEPRECATION_INFO_BOUNDARY
+                )
+            ):
+                deprecations.append(SchemaProblem(path, schema_error.message))
+            else:
+                info_deprecations.append(
+                    SchemaProblem(path, schema_error.message)
+                )
         else:
-            errors += problem
+            errors.append(SchemaProblem(path, schema_error.message))
 
-    if log_deprecations and deprecations:
-        message = _format_schema_problems(
-            deprecations,
-            prefix="Deprecated cloud-config provided:\n",
-            separator="\n",
-        )
-        # This warning doesn't fit the standardized util.deprecated() utility
-        # format, but it is a deprecation log, so log it directly.
-        LOG.deprecated(message)  # type: ignore
-    if strict and (errors or deprecations):
-        raise SchemaValidationError(errors, deprecations)
+    if log_deprecations:
+        if info_deprecations:
+            message = _format_schema_problems(
+                info_deprecations,
+                prefix="Deprecated cloud-config provided: ",
+            )
+            LOG.info(message)
+        if deprecations:
+            message = _format_schema_problems(
+                deprecations,
+                prefix="Deprecated cloud-config provided: ",
+            )
+            # This warning doesn't fit the standardized lifecycle.deprecated()
+            # utility format, but it is a deprecation log, so log it directly.
+            LOG.deprecated(message)  # type: ignore
+    if strict and (errors or deprecations or info_deprecations):
+        raise SchemaValidationError(errors, deprecations + info_deprecations)
     if errors:
         if log_details:
             details = _format_schema_problems(
                 errors,
-                prefix=f"Invalid {schema_type} provided:\n",
+                prefix=f"{schema_type.value} failed schema validation!\n",
                 separator="\n",
             )
         else:
             details = (
-                f"Invalid {schema_type} provided: "
-                "Please run 'sudo cloud-init schema --system' to "
-                "see the schema errors."
+                f"{schema_type.value} failed schema validation! "
+                "You may run 'sudo cloud-init schema --system' to "
+                "check the details."
             )
         LOG.warning(details)
     return True
@@ -635,11 +804,9 @@ def validate_cloudconfig_schema(
 class _Annotator:
     def __init__(
         self,
-        cloudconfig: dict,
         original_content: str,
         schemamarks: dict,
     ):
-        self._cloudconfig = cloudconfig
         self._original_content = original_content
         self._schemamarks = schemamarks
 
@@ -731,16 +898,6 @@ class _Annotator:
         if not schema_errors and not schema_deprecations:
             return self._original_content
         lines = self._original_content.split("\n")
-        if not isinstance(self._cloudconfig, dict):
-            # Return a meaningful message on empty cloud-config
-            return "\n".join(
-                lines
-                + [
-                    self._build_footer(
-                        "Errors", ["# E1: Cloud-config is not a YAML dict."]
-                    )
-                ]
-            )
         errors_by_line = self._build_errors_by_line(schema_errors)
         deprecations_by_line = self._build_errors_by_line(schema_deprecations)
         annotated_content = self._annotate_content(
@@ -750,7 +907,6 @@ class _Annotator:
 
 
 def annotated_cloudconfig_file(
-    cloudconfig: dict,
     original_content: str,
     schemamarks: dict,
     *,
@@ -760,7 +916,7 @@ def annotated_cloudconfig_file(
     """Return contents of the cloud-config file annotated with schema errors.
 
     @param cloudconfig: YAML-loaded dict from the original_content or empty
-        dict if unparseable.
+        dict if unparsable.
     @param original_content: The contents of a cloud-config file
     @param schemamarks: Dict with schema marks.
     @param schema_errors: Instance of `SchemaProblems`.
@@ -768,7 +924,7 @@ def annotated_cloudconfig_file(
 
     @return Annotated schema
     """
-    return _Annotator(cloudconfig, original_content, schemamarks).annotate(
+    return _Annotator(original_content, schemamarks).annotate(
         schema_errors or [], schema_deprecations or []
     )
 
@@ -780,7 +936,7 @@ def process_merged_cloud_config_part_problems(
 
     When merging multiple cloud-config parts cloud-init logs an error and
     ignores any user-data parts which are declared as #cloud-config but
-    cannot be processed. the hanlder.cloud_config module also leaves comments
+    cannot be processed. the handler.cloud_config module also leaves comments
     in the final merged config for every invalid part file which begin with
     MERGED_CONFIG_SCHEMA_ERROR_PREFIX to aid in triage.
     """
@@ -806,7 +962,7 @@ def process_merged_cloud_config_part_problems(
 def _get_config_type_and_rendered_userdata(
     config_path: str,
     content: str,
-    instance_data_path: str = None,
+    instance_data_path: Optional[str] = None,
 ) -> UserDataTypeAndDecodedContent:
     """
     Return tuple of user-data-type and rendered content.
@@ -816,9 +972,12 @@ def _get_config_type_and_rendered_userdata(
     :return: UserDataTypeAndDecodedContent
     :raises: SchemaValidationError when non-jinja content found but
         header declared ## template: jinja.
+    :raises JinjaSyntaxParsingException when jinja syntax error found.
+    :raises JinjaLoadError when jinja template fails to load.
     """
     from cloudinit.handlers.jinja_template import (
         JinjaLoadError,
+        JinjaSyntaxParsingException,
         NotJinjaError,
         render_jinja_payload_from_file,
     )
@@ -840,13 +999,18 @@ def _get_config_type_and_rendered_userdata(
                     )
                 ]
             ) from e
+        except JinjaSyntaxParsingException as e:
+            error(
+                "Failed to render templated user-data. " + str(e),
+                sys_exit=True,
+            )
         except JinjaLoadError as e:
             error(str(e), sys_exit=True)
         schema_position = "format-l2.c1"
         user_data_type = type_from_starts_with(content)
     if not user_data_type:  # Neither jinja2 nor #cloud-config
         header_line, _, _ = content.partition("\n")
-        raise SchemaValidationError(
+        raise SchemaValidationInvalidHeaderError(
             [
                 SchemaProblem(
                     schema_position,
@@ -867,16 +1031,16 @@ def _get_config_type_and_rendered_userdata(
 def validate_cloudconfig_file(
     config_path: str,
     schema: dict,
-    schema_type: str = "cloud-config",
+    schema_type: SchemaType = SchemaType.CLOUD_CONFIG,
     annotate: bool = False,
-    instance_data_path: str = None,
+    instance_data_path: Optional[str] = None,
 ) -> bool:
     """Validate cloudconfig file adheres to a specific jsonschema.
 
     @param config_path: Path to the yaml cloud-config file to parse, or None
         to default to system userdata from Paths object.
     @param schema: Dict describing a valid jsonschema to validate against.
-    @param schema_type: One of network-config or cloud-config.
+    @param schema_type: One of SchemaType.NETWORK_CONFIG or CLOUD_CONFIG
     @param annotate: Boolean set True to print original config file with error
         annotations on the offending lines.
     @param instance_data_path: Path to instance_data JSON, used for text/jinja
@@ -886,17 +1050,19 @@ def validate_cloudconfig_file(
     :raises SchemaValidationError containing any of schema_errors encountered.
     :raises RuntimeError when config_path does not exist.
     """
-    decoded_content = load_file(config_path, decode=True)
+    from cloudinit.net.netplan import available as netplan_available
+
+    decoded_content = load_text_file(config_path)
     if not decoded_content:
         print(
             "Empty '%s' found at %s. Nothing to validate."
-            % (schema_type, config_path)
+            % (schema_type.value, config_path)
         )
         return False
 
-    if schema_type in ("network-config",):
+    if schema_type in (SchemaType.NETWORK_CONFIG,):
         decoded_config = UserDataTypeAndDecodedContent(
-            schema_type, decoded_content
+            schema_type.value, decoded_content
         )
     else:
         decoded_config = _get_config_type_and_rendered_userdata(
@@ -913,7 +1079,7 @@ def validate_cloudconfig_file(
         if annotate:
             cloudconfig, marks = safeyaml.load_with_marks(content)
         else:
-            cloudconfig = safeyaml.load(content)
+            cloudconfig = yaml.safe_load(content)
             marks = {}
     except yaml.YAMLError as e:
         line = column = 1
@@ -935,7 +1101,7 @@ def validate_cloudconfig_file(
         if annotate:
             print(
                 annotated_cloudconfig_file(
-                    {}, content, {}, schema_errors=schema_error.schema_errors
+                    content, {}, schema_errors=schema_error.schema_errors
                 )
             )
         raise schema_error from e
@@ -943,27 +1109,39 @@ def validate_cloudconfig_file(
         # Return a meaningful message on empty cloud-config
         if not annotate:
             raise RuntimeError(
-                f"{schema_type} {config_path} is not a YAML dict."
+                f"{schema_type.value} {config_path} is not a YAML dict."
             )
-    if schema_type == "network-config":
-        # Pop optional top-level "network" key when present
-        netcfg = cloudconfig.get("network", cloudconfig)
-        if not netcfg:
+    if schema_type == SchemaType.NETWORK_CONFIG:
+        if not cloudconfig.get("network", cloudconfig):
             print("Skipping network-config schema validation on empty config.")
             return False
-        elif netcfg.get("version") != 1:
-            print(
-                "Skipping network-config schema validation."
-                " No network schema for version:"
-                f" {netcfg.get('version')}"
-            )
-            return False
+        network_version = network_schema_version(cloudconfig)
+        if network_version == 2:
+            schema_type = SchemaType.NETWORK_CONFIG_V2
+            if netplan_validate_network_schema(
+                network_config=cloudconfig, strict=True, annotate=annotate
+            ):
+                return True  # schema validation performed by netplan
+            elif netplan_available():
+                print(
+                    "Skipping network-config schema validation for version: 2."
+                    " No netplan API available."
+                )
+                return False
+        elif network_version == 1:
+            schema_type = SchemaType.NETWORK_CONFIG_V1
+            # refresh schema since NETWORK_CONFIG defaults to V2
+            schema = get_schema(schema_type)
     try:
         if not validate_cloudconfig_schema(
-            cloudconfig, schema, strict=True, log_deprecations=False
+            cloudconfig,
+            schema=schema,
+            schema_type=schema_type,
+            strict=True,
+            log_deprecations=False,
         ):
             print(
-                f"Skipping {schema_type} schema validation."
+                f"Skipping {schema_type.value} schema validation."
                 " Jsonschema dependency missing."
             )
             return False
@@ -973,7 +1151,6 @@ def validate_cloudconfig_file(
         if annotate:
             print(
                 annotated_cloudconfig_file(
-                    cloudconfig,
                     content,
                     marks,
                     schema_errors=errors,
@@ -992,396 +1169,11 @@ def validate_cloudconfig_file(
     return True
 
 
-def _sort_property_order(value):
-    """Provide a sorting weight for documentation of property types.
-
-    Weight values ensure 'array' sorted after 'object' which is sorted
-    after anything else which remains unsorted.
-    """
-    if value == "array":
-        return 2
-    elif value == "object":
-        return 1
-    return 0
-
-
-def _flatten(xs):
-    for x in xs:
-        if isinstance(x, Iterable) and not isinstance(x, (str, bytes)):
-            yield from _flatten(x)
-        else:
-            yield x
-
-
-def _collect_subschema_types(property_dict: dict, multi_key: str) -> List[str]:
-    property_types = []
-    for subschema in property_dict.get(multi_key, {}):
-        if subschema.get(DEPRECATED_KEY):  # don't document deprecated types
-            continue
-        if subschema.get("enum"):
-            property_types.extend(
-                [
-                    f"``{_YAML_MAP.get(enum_value, enum_value)}``"
-                    for enum_value in subschema.get("enum", [])
-                ]
-            )
-        elif subschema.get("type"):
-            property_types.append(subschema["type"])
-    return list(_flatten(property_types))
-
-
-def _get_property_type(property_dict: dict, defs: dict) -> str:
-    """Return a string representing a property type from a given
-    jsonschema.
-    """
-    _flatten_schema_refs(property_dict, defs)
-    property_types = property_dict.get("type", [])
-    if not isinstance(property_types, list):
-        property_types = [property_types]
-    # A property_dict cannot have simultaneously more than one of these props
-    if property_dict.get("enum"):
-        property_types = [
-            f"``{_YAML_MAP.get(k, k)}``" for k in property_dict["enum"]
-        ]
-    elif property_dict.get("oneOf"):
-        property_types.extend(_collect_subschema_types(property_dict, "oneOf"))
-    elif property_dict.get("anyOf"):
-        property_types.extend(_collect_subschema_types(property_dict, "anyOf"))
-    if len(property_types) == 1:
-        property_type = property_types[0]
-    else:
-        property_types.sort(key=_sort_property_order)
-        property_type = "/".join(property_types)
-    items = property_dict.get("items", {})
-    sub_property_types = items.get("type", [])
-    if not isinstance(sub_property_types, list):
-        sub_property_types = [sub_property_types]
-    # Collect each item type
-    prune_undefined = bool(sub_property_types)
-    for sub_item in chain(items.get("oneOf", {}), items.get("anyOf", {})):
-        sub_type = _get_property_type(sub_item, defs)
-        if prune_undefined and sub_type == "UNDEFINED":
-            # If the main object has a type, then sub-schemas are allowed to
-            # omit the type. Prune subschema undefined types.
-            continue
-        sub_property_types.append(sub_type)
-    if sub_property_types:
-        if len(sub_property_types) == 1:
-            return f"{property_type} of {sub_property_types[0]}"
-        sub_property_types.sort(key=_sort_property_order)
-        sub_property_doc = f"({'/'.join(sub_property_types)})"
-        return f"{property_type} of {sub_property_doc}"
-    return property_type or "UNDEFINED"
-
-
-def _parse_description(description, prefix) -> str:
-    """Parse description from the meta in a format that we can better
-    display in our docs. This parser does three things:
-
-    - Guarantee that a paragraph will be in a single line
-    - Guarantee that each new paragraph will be aligned with
-      the first paragraph
-    - Proper align lists of items
-
-    @param description: The original description in the meta.
-    @param prefix: The number of spaces used to align the current description
-    """
-    list_paragraph = prefix
-    description = re.sub(r"(\S)\n(\S)", r"\1 \2", description)
-    description = re.sub(r"\n\n", r"\n\n{}".format(prefix), description)
-    description = re.sub(
-        r"\n( +)-", r"\n{}-".format(list_paragraph), description
-    )
-
-    return description
-
-
-def _flatten_schema_refs(src_cfg: dict, defs: dict):
-    """Flatten schema: replace $refs in src_cfg with definitions from $defs."""
-    if "$ref" in src_cfg:
-        reference = src_cfg.pop("$ref").replace("#/$defs/", "")
-        # Update the defined references in subschema for doc rendering
-        src_cfg.update(defs[reference])
-    if "items" in src_cfg:
-        if "$ref" in src_cfg["items"]:
-            reference = src_cfg["items"].pop("$ref").replace("#/$defs/", "")
-            # Update the references in subschema for doc rendering
-            src_cfg["items"].update(defs[reference])
-        if "oneOf" in src_cfg["items"]:
-            for sub_schema in src_cfg["items"]["oneOf"]:
-                if "$ref" in sub_schema:
-                    reference = sub_schema.pop("$ref").replace("#/$defs/", "")
-                    sub_schema.update(defs[reference])
-    for sub_schema in chain(
-        src_cfg.get("oneOf", []),
-        src_cfg.get("anyOf", []),
-        src_cfg.get("allOf", []),
-    ):
-        if "$ref" in sub_schema:
-            reference = sub_schema.pop("$ref").replace("#/$defs/", "")
-            sub_schema.update(defs[reference])
-
-
-def _flatten_schema_all_of(src_cfg: dict):
-    """Flatten schema: Merge allOf.
-
-    If a schema as allOf, then all of the sub-schemas must hold. Therefore
-    it is safe to merge them.
-    """
-    sub_schemas = src_cfg.pop("allOf", None)
-    if not sub_schemas:
-        return
-    for sub_schema in sub_schemas:
-        src_cfg.update(sub_schema)
-
-
-def _get_property_description(prop_config: dict) -> str:
-    """Return accumulated property description.
-
-    Account for the following keys:
-    - top-level description key
-    - any description key present in each subitem under anyOf or allOf
-
-    Order and deprecated property description after active descriptions.
-    Add a trailing stop "." to any description not ending with ":".
-    """
-
-    def assign_descriptions(
-        config: dict, descriptions: list, deprecated_descriptions: list
-    ):
-        if any(
-            map(
-                config.get,
-                ("deprecated_version", "changed_version", "new_version"),
-            )
-        ):
-            deprecated_descriptions.append(
-                _add_deprecated_changed_or_new_msg(config)
-            )
-        elif config.get("description"):
-            descriptions.append(_add_deprecated_changed_or_new_msg(config))
-
-    oneOf = prop_config.get("oneOf", {})
-    anyOf = prop_config.get("anyOf", {})
-    descriptions: list = []
-    deprecated_descriptions: list = []
-
-    assign_descriptions(prop_config, descriptions, deprecated_descriptions)
-    for sub_item in chain(oneOf, anyOf):
-        assign_descriptions(sub_item, descriptions, deprecated_descriptions)
-
-    # order deprecated descrs last
-    description = ". ".join(chain(descriptions, deprecated_descriptions))
-    if description:
-        description = f" {description}"
-    return description
-
-
-def _get_property_doc(schema: dict, defs: dict, prefix="   ") -> str:
-    """Return restructured text describing the supported schema properties."""
-    new_prefix = prefix + "  "
-    properties = []
-    if schema.get("hidden") is True:
-        return ""  # no docs for this schema
-    property_keys = [
-        key
-        for key in ("properties", "patternProperties")
-        if "hidden" not in schema or key not in schema["hidden"]
-    ]
-    property_schemas = [schema.get(key, {}) for key in property_keys]
-
-    for prop_schema in property_schemas:
-        for prop_key, prop_config in prop_schema.items():
-            _flatten_schema_refs(prop_config, defs)
-            _flatten_schema_all_of(prop_config)
-            if prop_config.get("hidden") is True:
-                continue  # document nothing for this property
-
-            description = _get_property_description(prop_config)
-
-            # Define prop_name and description for SCHEMA_PROPERTY_TMPL
-            label = prop_config.get("label", prop_key)
-            properties.append(
-                SCHEMA_PROPERTY_TMPL.format(
-                    prefix=prefix,
-                    prop_name=label,
-                    description=_parse_description(description, prefix + "  "),
-                    prop_type=_get_property_type(prop_config, defs),
-                )
-            )
-            items = prop_config.get("items")
-            if items:
-                _flatten_schema_refs(items, defs)
-                if items.get("properties") or items.get("patternProperties"):
-                    properties.append(
-                        SCHEMA_LIST_ITEM_TMPL.format(
-                            prefix=new_prefix, prop_name=label
-                        )
-                    )
-                    properties.append(
-                        _get_property_doc(items, defs=defs, prefix=new_prefix)
-                    )
-                for alt_schema in items.get("oneOf", []):
-                    if alt_schema.get("properties") or alt_schema.get(
-                        "patternProperties"
-                    ):
-                        properties.append(
-                            SCHEMA_LIST_ITEM_TMPL.format(
-                                prefix=new_prefix, prop_name=label
-                            )
-                        )
-                        properties.append(
-                            _get_property_doc(
-                                alt_schema, defs=defs, prefix=new_prefix
-                            )
-                        )
-            if (
-                "properties" in prop_config
-                or "patternProperties" in prop_config
-            ):
-                properties.append(
-                    _get_property_doc(
-                        prop_config, defs=defs, prefix=new_prefix
-                    )
-                )
-    return "\n\n".join(properties)
-
-
-def _get_examples(meta: MetaSchema) -> str:
-    """Return restructured text describing the meta examples if present."""
-    examples = meta.get("examples")
-    if not examples:
-        return ""
-    rst_content = SCHEMA_EXAMPLES_HEADER
-    for count, example in enumerate(examples, 1):
-        rst_content += SCHEMA_EXAMPLES_SPACER_TEMPLATE.format(
-            example_count=count
-        )
-        indented_lines = textwrap.indent(example, "   ").split("\n")
-        rst_content += "\n".join(indented_lines)
-    return rst_content
-
-
-def _get_activate_by_schema_keys_doc(meta: MetaSchema) -> str:
-    if not meta.get("activate_by_schema_keys"):
-        return ""
-    schema_keys = ", ".join(
-        f"``{k}``" for k in meta["activate_by_schema_keys"]
-    )
-    return f"**Activate only on keys:** {schema_keys}\n\n"
-
-
-def get_meta_doc(meta: MetaSchema, schema: Optional[dict] = None) -> str:
-    """Return reStructured text rendering the provided metadata.
-
-    @param meta: Dict of metadata to render.
-    @param schema: Optional module schema, if absent, read global schema.
-    @raise KeyError: If metadata lacks an expected key.
-    """
-
-    if schema is None:
-        schema = get_schema(schema_type="cloud-config")
-    if not meta or not schema:
-        raise ValueError("Expected non-empty meta and schema")
-    keys = set(meta.keys())
-    required_keys = {
-        "id",
-        "title",
-        "examples",
-        "frequency",
-        "distros",
-        "description",
-        "name",
-    }
-    optional_keys = {"activate_by_schema_keys"}
-    error_message = ""
-    if required_keys - keys:
-        error_message = "Missing required keys in module meta: {}".format(
-            required_keys - keys
-        )
-    elif keys - required_keys - optional_keys:
-        error_message = (
-            "Additional unexpected keys found in module meta: {}".format(
-                keys - required_keys
-            )
-        )
-    if error_message:
-        raise KeyError(error_message)
-
-    # cast away type annotation
-    meta_copy = dict(deepcopy(meta))
-    meta_copy["property_header"] = ""
-    meta_copy["prefix6"] = "      "
-    meta_copy["prefix3"] = "   "
-    meta_copy["description"] = textwrap.indent(
-        cast(str, meta_copy["description"]), "      "
-    )
-    defs = schema.get("$defs", {})
-    if defs.get(meta["id"]):
-        schema = defs.get(meta["id"], {})
-        schema = cast(dict, schema)
-    if any(schema["properties"].values()):
-        try:
-            meta_copy["property_doc"] = _get_property_doc(
-                schema, defs=defs, prefix="      "
-            )
-        except AttributeError:
-            LOG.warning("Unable to render property_doc due to invalid schema")
-            meta_copy["property_doc"] = ""
-    if not meta_copy.get("property_doc", ""):
-        meta_copy[
-            "property_doc"
-        ] = "      No schema definitions for this module"
-    meta_copy["examples"] = textwrap.indent(_get_examples(meta), "      ")
-    if not meta_copy["examples"]:
-        meta_copy["examples"] = "         No examples for this module"
-    meta_copy["distros"] = ", ".join(meta["distros"])
-    # Need an underbar of the same length as the name
-    meta_copy["title_underbar"] = re.sub(r".", "-", meta["name"])
-    meta_copy["activate_by_schema_keys"] = _get_activate_by_schema_keys_doc(
-        meta
-    )
-    template = SCHEMA_DOC_TMPL.format(**meta_copy)
-    return template
-
-
-def get_modules() -> dict:
-    configs_dir = os.path.dirname(os.path.abspath(__file__))
-    return get_modules_from_dir(configs_dir)
-
-
-def load_doc(requested_modules: list) -> str:
-    """Load module docstrings
-
-    Docstrings are generated on module load. Reduce, reuse, recycle.
-    """
-    docs = ""
-    all_modules = list(get_modules().values()) + ["all"]
-    invalid_docs = set(requested_modules).difference(set(all_modules))
-    if invalid_docs:
-        error(
-            "Invalid --docs value {}. Must be one of: {}".format(
-                list(invalid_docs),
-                ", ".join(all_modules),
-            ),
-            sys_exit=True,
-        )
-    for mod_name in all_modules:
-        if "all" in requested_modules or mod_name in requested_modules:
-            (mod_locs, _) = importer.find_module(
-                mod_name, ["cloudinit.config"], ["meta"]
-            )
-            if mod_locs:
-                mod = importer.import_module(mod_locs[0])
-                docs += mod.__doc__ or ""
-    return docs
-
-
 def get_schema_dir() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "schemas")
 
 
-def get_schema(schema_type: str = "cloud-config") -> dict:
+def get_schema(schema_type: SchemaType = SchemaType.CLOUD_CONFIG) -> dict:
     """Return jsonschema for a specific type.
 
     Return empty schema when no specific schema file exists.
@@ -1391,11 +1183,11 @@ def get_schema(schema_type: str = "cloud-config") -> dict:
     )
     full_schema = None
     try:
-        full_schema = json.loads(load_file(schema_file))
+        full_schema = json.loads(load_text_file(schema_file))
     except (IOError, OSError):
         LOG.warning(
-            "Skipping %s schema valiation. No JSON schema file found %s.",
-            schema_type,
+            "Skipping %s schema validation. No JSON schema file found %s.",
+            schema_type.value,
             schema_file,
         )
         return {}
@@ -1424,10 +1216,13 @@ def get_parser(parser=None):
         "-t",
         "--schema-type",
         type=str,
-        choices=["cloud-config", "network-config"],
+        choices=[
+            SchemaType.CLOUD_CONFIG.value,
+            SchemaType.NETWORK_CONFIG.value,
+        ],
         help=(
             "When providing --config-file, the schema type to validate config"
-            " against. Default: cloud-config"
+            f" against. Default: {SchemaType.CLOUD_CONFIG}"
         ),
     )
     parser.add_argument(
@@ -1450,15 +1245,6 @@ def get_parser(parser=None):
         ),
     )
     parser.add_argument(
-        "-d",
-        "--docs",
-        nargs="+",
-        help=(
-            "Print schema module docs. Choices: all or"
-            " space-delimited cc_names."
-        ),
-    )
-    parser.add_argument(
         "--annotate",
         action="store_true",
         default=False,
@@ -1467,28 +1253,61 @@ def get_parser(parser=None):
     return parser
 
 
-def handle_schema_args(name, args):
-    """Handle provided schema args and perform the appropriate actions."""
-    exclusive_args = [args.config_file, args.docs, args.system]
+def _assert_exclusive_args(args):
+    """Error or warn on invalid exclusive parameter combinations."""
+    exclusive_args = [args.config_file, args.system]
     if len([arg for arg in exclusive_args if arg]) != 1:
         error(
-            "Expected one of --config-file, --system or --docs arguments",
+            "Expected one of --config-file or --system arguments",
             sys_exit=True,
         )
-    if any([args.system, args.docs]) and args.schema_type:
+    if args.system and args.schema_type:
         print(
-            "WARNING: The --schema-type parameter is inapplicable when either"
-            " --system or --docs present"
+            "WARNING: The --schema-type parameter is inapplicable when "
+            "--system is present"
         )
-    if args.annotate and args.docs:
-        error(
-            "Invalid flag combination. Cannot use --annotate with --docs",
-            sys_exit=True,
-        )
-    full_schema = get_schema(schema_type="cloud-config")
-    if args.docs:
-        print(load_doc(args.docs))
-        return
+
+
+def get_config_paths_from_args(
+    args,
+) -> Tuple[str, List[InstanceDataPart]]:
+    """Return appropriate instance-data.json and instance data parts
+
+    Based on command line args, and user permissions, determine the
+    appropriate instance-data.json to source for jinja templates and
+    a list of applicable InstanceDataParts such as user-data, vendor-data
+    and network-config for which to validate schema. Avoid returning any
+    InstanceDataParts when the expected config_path does not exist.
+
+    :return: A tuple of the instance-data.json path and a list of
+        viable InstanceDataParts present on the system.
+    """
+
+    def get_processed_or_fallback_path(
+        paths: Paths,
+        primary_path_key: str,
+        raw_fallback_path_key: str,
+    ) -> str:
+        """Get processed data path when non-empty of fallback to raw data path.
+
+        - When primary path and raw path exist and are empty, prefer primary
+          path.
+        - When primary path is empty but the raw fallback path is non-empty,
+          this indicates an invalid and ignored raw user-data was provided and
+          cloud-init emitted a warning and did not process unknown raw
+          user-data.
+          In the case of invalid raw user-data header, prefer
+          raw_fallback_path_key so actionable sensible warnings can be
+          reported to the user about the raw unparsable user-data.
+        """
+        primary_datapath = paths.get_ipath(primary_path_key) or ""
+        with suppress(FileNotFoundError):
+            if not os.stat(primary_datapath).st_size:
+                raw_path = paths.get_ipath(raw_fallback_path_key) or ""
+                if os.stat(raw_path).st_size:
+                    return raw_path
+        return primary_datapath
+
     try:
         paths = read_cfg_paths(fetch_existing_datasource="trust")
     except (IOError, OSError) as e:
@@ -1511,8 +1330,19 @@ def handle_schema_args(name, args):
         instance_data_path = paths.get_runpath("instance_data")
     else:
         instance_data_path = paths.get_runpath("instance_data_sensitive")
+    config_files: List[InstanceDataPart] = []
     if args.config_file:
-        config_files = ((args.schema_type, args.config_file),)
+        if args.schema_type:
+            schema_type = SchemaType(args.schema_type)
+        else:
+            schema_type = SchemaType.CLOUD_CONFIG
+        if schema_type == SchemaType.NETWORK_CONFIG:
+            instancedata_type = InstanceDataType.NETWORK_CONFIG
+        else:
+            instancedata_type = InstanceDataType.USERDATA
+        config_files.append(
+            InstanceDataPart(instancedata_type, schema_type, args.config_file)
+        )
     else:
         if os.getuid() != 0:
             error(
@@ -1520,95 +1350,131 @@ def handle_schema_args(name, args):
                 " user. Try using sudo.",
                 sys_exit=True,
             )
-        userdata_file = paths.get_ipath("cloud_config")
-        if not userdata_file:
-            error(
-                "Unable to obtain user data file. No instance data available",
-                sys_exit=True,
-            )
-            return  # Helps typing
-
-        # Prefer raw user-data.txt when processed cloud-config is empty and
-        # raw user-data.txt is not because processed cloud-config.txt will
-        # not be written in cases where user-data header is not supported.
-        try:
-            if os.stat(userdata_file).st_size == 0:
-                raw_userdata_file = paths.get_ipath("userdata_raw")
-                if os.stat(raw_userdata_file).st_size:
-                    userdata_file = raw_userdata_file
-        except FileNotFoundError:
-            # Error handling on absent userdata_file below
-            pass
-
-        config_files = (("user-data", userdata_file),)
-        supplemental_config_files = (
-            ("vendor-data", paths.get_ipath("vendor_cloud_config")),
-            ("vendor2-data", paths.get_ipath("vendor2_cloud_config")),
-            ("network-config", paths.get_ipath("network_config")),
+        userdata_file = get_processed_or_fallback_path(
+            paths, "cloud_config", "userdata_raw"
         )
-        for cfg_type, cfg_file in supplemental_config_files:
-            if cfg_file and os.path.exists(cfg_file):
-                config_files += ((cfg_type, cfg_file),)
-    if not os.path.exists(config_files[0][1]):
+        config_files.append(
+            InstanceDataPart(
+                InstanceDataType.USERDATA,
+                SchemaType.CLOUD_CONFIG,
+                userdata_file,
+            )
+        )
+        supplemental_config_files: List[InstanceDataPart] = [
+            InstanceDataPart(
+                InstanceDataType.VENDORDATA,
+                SchemaType.CLOUD_CONFIG,
+                get_processed_or_fallback_path(
+                    paths, "vendor_cloud_config", "vendordata_raw"
+                ),
+            ),
+            InstanceDataPart(
+                InstanceDataType.VENDOR2DATA,
+                SchemaType.CLOUD_CONFIG,
+                get_processed_or_fallback_path(
+                    paths, "vendor2_cloud_config", "vendordata2_raw"
+                ),
+            ),
+            InstanceDataPart(
+                InstanceDataType.NETWORK_CONFIG,
+                SchemaType.NETWORK_CONFIG,
+                paths.get_ipath("network_config") or "",
+            ),
+        ]
+        for data_part in supplemental_config_files:
+            if data_part.config_path and os.path.exists(data_part.config_path):
+                config_files.append(data_part)
+    if not os.path.exists(config_files[0].config_path):
         error(
-            f"Config file {config_files[0][1]} does not exist",
+            f"Config file {config_files[0].config_path} does not exist",
             fmt="Error: {}",
             sys_exit=True,
         )
+    return instance_data_path, config_files
+
+
+def handle_schema_args(name, args):
+    """Handle provided schema args and perform the appropriate actions."""
+    _assert_exclusive_args(args)
+    full_schema = get_schema()
+    instance_data_path, config_files = get_config_paths_from_args(args)
 
     nested_output_prefix = ""
     multi_config_output = bool(len(config_files) > 1)
     if multi_config_output:
         print(
             "Found cloud-config data types: %s"
-            % ", ".join(cfg_type for cfg_type, _ in config_files)
+            % ", ".join(str(cfg_part.config_type) for cfg_part in config_files)
         )
         nested_output_prefix = "  "
 
     error_types = []
-    for idx, (cfg_type, cfg_file) in enumerate(config_files, 1):
+    for idx, cfg_part in enumerate(config_files, 1):
         performed_schema_validation = False
         if multi_config_output:
-            print(f"\n{idx}. {cfg_type} at {cfg_file}:")
-        if cfg_type == "network-config":
-            cfg_schema = get_schema(cfg_type)
-            schema_type = cfg_type
+            print(
+                f"\n{idx}. {cfg_part.config_type} at {cfg_part.config_path}:"
+            )
+        if cfg_part.schema_type == SchemaType.NETWORK_CONFIG:
+            cfg_schema = get_schema(cfg_part.schema_type)
         else:
             cfg_schema = full_schema
-            cfg_type = "user-data" if cfg_type == "cloud-config" else cfg_type
-            schema_type = "cloud-config"
         try:
             performed_schema_validation = validate_cloudconfig_file(
-                cfg_file,
+                cfg_part.config_path,
                 cfg_schema,
-                schema_type,
+                cfg_part.schema_type,
                 args.annotate,
                 instance_data_path,
             )
         except SchemaValidationError as e:
-            if not cfg_type:
-                cfg_type = "UNKNOWN_CONFIG_HEADER"
             if not args.annotate:
-                print(f"{nested_output_prefix}Invalid {cfg_type} {cfg_file}")
+                print(
+                    f"{nested_output_prefix}Invalid"
+                    f" {cfg_part.config_type} {cfg_part.config_path}"
+                )
                 error(
                     str(e),
                     fmt=nested_output_prefix + "Error: {}\n",
                 )
-                error_types.append(cfg_type)
+            error_types.append(cfg_part.config_type)
         except RuntimeError as e:
-            print(f"{nested_output_prefix}Invalid {cfg_type}")
+            print(f"{nested_output_prefix}Invalid {cfg_part.config_type!s}")
             error(str(e), fmt=nested_output_prefix + "Error: {}\n")
-            error_types.append(cfg_type)
+            error_types.append(cfg_part.config_type)
         else:
             if performed_schema_validation:
-                cfg = cfg_file if args.config_file else cfg_type
-                print(f"{nested_output_prefix}Valid schema {cfg}")
+                if args.config_file:
+                    cfg = cfg_part.config_path
+                else:
+                    cfg = str(cfg_part.config_type)
+                print(f"{nested_output_prefix}Valid schema {cfg!s}")
     if error_types:
         error(
-            ", ".join(error_type for error_type in error_types),
+            ", ".join(str(error_type) for error_type in error_types),
             fmt="Error: Invalid schema: {}\n",
             sys_exit=True,
         )
+
+
+def get_meta_doc(*_args, **_kwargs) -> str:
+    """Provide a stub for backwards compatibility.
+
+    This function is no longer used, but earlier versions of modules
+    required this function for documentation purposes. This is a stub so
+    that custom modules do not break on upgrade.
+    """
+    lifecycle.log_with_downgradable_level(
+        logger=LOG,
+        version="24.4",
+        requested_level=logging.WARNING,
+        msg=(
+            "The 'get_meta_doc()' function is deprecated and will be removed "
+            "in a future version of cloud-init."
+        ),
+        args=(),
+    )
+    return ""
 
 
 def main():

@@ -1,6 +1,8 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
+import copy
 import logging
+import string
 from unittest import mock
 
 import pytest
@@ -12,7 +14,11 @@ from cloudinit.config.schema import (
     get_schema,
     validate_cloudconfig_schema,
 )
-from tests.unittests.helpers import does_not_raise, skipUnlessJsonSchema
+from tests.unittests.helpers import (
+    SCHEMA_EMPTY_ERROR,
+    does_not_raise,
+    skipUnlessJsonSchema,
+)
 from tests.unittests.util import get_cloud
 
 MODPATH = "cloudinit.config.cc_set_passwords."
@@ -21,7 +27,9 @@ SYSTEMD_CHECK_CALL = mock.call(
     ["systemctl", "show", "--property", "ActiveState", "--value", "ssh"]
 )
 SYSTEMD_RESTART_CALL = mock.call(
-    ["systemctl", "restart", "ssh"], capture=True, rcs=None
+    ["systemctl", "restart", "ssh", "--job-mode=ignore-dependencies"],
+    capture=True,
+    rcs=None,
 )
 SERVICE_RESTART_CALL = mock.call(
     ["service", "ssh", "restart"], capture=True, rcs=None
@@ -31,7 +39,7 @@ SERVICE_RESTART_CALL = mock.call(
 @pytest.fixture(autouse=True)
 def common_fixtures(mocker):
     mocker.patch("cloudinit.distros.uses_systemd", return_value=True)
-    mocker.patch("cloudinit.util.write_to_console")
+    mocker.patch("cloudinit.log.log_util.write_to_console")
 
 
 class TestHandleSSHPwauth:
@@ -263,7 +271,7 @@ class TestSetPasswordsHandle:
     )
     def test_random_passwords(self, user_cfg, mocker, caplog):
         """handle parses command set random passwords."""
-        m_multi_log = mocker.patch(f"{MODPATH}util.multi_log")
+        m_multi_log = mocker.patch(f"{MODPATH}log_util.multi_log")
         mocker.patch(f"{MODPATH}subp.subp")
 
         cloud = get_cloud()
@@ -504,6 +512,7 @@ expire_cases = [
 class TestExpire:
     @pytest.mark.parametrize("cfg", expire_cases)
     def test_expire(self, cfg, mocker, caplog):
+        cfg = copy.deepcopy(cfg)
         cloud = get_cloud()
         mocker.patch(f"{MODPATH}subp.subp")
         mocker.patch.object(cloud.distro, "chpasswd")
@@ -529,7 +538,9 @@ class TestExpire:
     def test_expire_old_behavior(self, cfg, mocker, caplog):
         # Previously expire didn't apply to hashed passwords.
         # Ensure we can preserve that case on older releases
-        features.EXPIRE_APPLIES_TO_HASHED_USERS = False
+        mocker.patch.object(features, "EXPIRE_APPLIES_TO_HASHED_USERS", False)
+
+        cfg = copy.deepcopy(cfg)
         cloud = get_cloud()
         mocker.patch(f"{MODPATH}subp.subp")
         mocker.patch.object(cloud.distro, "chpasswd")
@@ -549,6 +560,43 @@ class TestExpire:
         else:
             assert m_expire.call_args_list == []
             assert "Expired passwords" not in caplog.text
+
+
+class TestRandUserPassword:
+    def _get_str_class_num(self, str):
+        return sum(
+            [
+                any(c.islower() for c in str),
+                any(c.isupper() for c in str),
+                any(c.isdigit() for c in str),
+                any(c in string.punctuation for c in str),
+            ]
+        )
+
+    @pytest.mark.parametrize(
+        "strlen, expected_result",
+        [
+            (1, ValueError),
+            (2, ValueError),
+            (3, ValueError),
+            (4, 4),
+            (5, 4),
+            (5, 4),
+            (6, 4),
+            (20, 4),
+        ],
+    )
+    def test_rand_user_password(self, strlen, expected_result):
+        if expected_result is ValueError:
+            with pytest.raises(
+                expected_result,
+                match="Password length must be at least 4 characters.",
+            ):
+                setpass.rand_user_password(strlen)
+        else:
+            rand_password = setpass.rand_user_password(strlen)
+            assert len(rand_password) == strlen
+            assert self._get_str_class_num(rand_password) == expected_result
 
 
 class TestSetPasswordsSchema:
@@ -718,7 +766,8 @@ class TestSetPasswordsSchema:
             (
                 {"chpasswd": {"list": []}},
                 pytest.raises(
-                    SchemaValidationError, match=r"\[\] is too short"
+                    SchemaValidationError,
+                    match=rf"\[\] {SCHEMA_EMPTY_ERROR}",
                 ),
             ),
         ],

@@ -3,12 +3,18 @@ import logging
 import os
 
 import pytest
+import yaml
 
 from tests.integration_tests.clouds import IntegrationCloud
 from tests.integration_tests.conftest import get_validated_source
 from tests.integration_tests.integration_settings import PLATFORM
-from tests.integration_tests.releases import CURRENT_RELEASE, FOCAL, IS_UBUNTU
-from tests.integration_tests.util import verify_clean_log
+from tests.integration_tests.releases import (
+    CURRENT_RELEASE,
+    FOCAL,
+    IS_UBUNTU,
+    JAMMY,
+)
+from tests.integration_tests.util import verify_clean_boot, verify_clean_log
 
 LOG = logging.getLogger("integration_testing.test_upgrade")
 
@@ -56,7 +62,6 @@ def test_clean_boot_of_upgraded_package(session_cloud: IntegrationCloud):
     source = get_validated_source(session_cloud)
     if not source.installs_new_version():
         pytest.skip(UNSUPPORTED_INSTALL_METHOD_MSG.format(source))
-        return  # type checking doesn't understand that skip raises
     launch_kwargs = {
         "image_id": session_cloud.initial_image_id,
     }
@@ -76,11 +81,8 @@ def test_clean_boot_of_upgraded_package(session_cloud: IntegrationCloud):
         pre_cloud_blame = instance.execute("cloud-init analyze blame")
 
         # Ensure no issues pre-upgrade
-        log = instance.read_from_file("/var/log/cloud-init.log")
-        assert not json.loads(pre_result)["v1"]["errors"]
-
         try:
-            verify_clean_log(log)
+            verify_clean_boot(instance)
         except AssertionError:
             LOG.warning(
                 "There were errors/warnings/tracebacks pre-upgrade. "
@@ -88,7 +90,7 @@ def test_clean_boot_of_upgraded_package(session_cloud: IntegrationCloud):
             )
 
         # Upgrade
-        instance.install_new_cloud_init(source, take_snapshot=False)
+        instance.install_new_cloud_init(source)
 
         # 'cloud-init init' helps us understand if our pickling upgrade paths
         # have broken across re-constitution of a cached datasource. Some
@@ -117,10 +119,7 @@ def test_clean_boot_of_upgraded_package(session_cloud: IntegrationCloud):
         post_cloud_blame = instance.execute("cloud-init analyze blame")
 
         # Ensure no issues post-upgrade
-        assert not json.loads(pre_result)["v1"]["errors"]
-
-        log = instance.read_from_file("/var/log/cloud-init.log")
-        verify_clean_log(log)
+        verify_clean_boot(instance)
 
         # Ensure important things stayed the same
         assert pre_hostname == post_hostname
@@ -137,7 +136,15 @@ def test_clean_boot_of_upgraded_package(session_cloud: IntegrationCloud):
                 assert post_json["v1"]["datasource"].startswith(
                     "DataSourceAzure"
                 )
-        assert pre_network == post_network
+        if CURRENT_RELEASE < JAMMY:
+            # Assert the full content is preserved including header comment
+            # since cloud-init writes the file directly and does not use
+            # netplan API to write 50-cloud-init.yaml.
+            assert pre_network == post_network
+        else:
+            # Jammy and later Netplan API is used and doesn't allow
+            # cloud-init to write header comments in network config
+            assert yaml.safe_load(pre_network) == yaml.safe_load(post_network)
 
         # Calculate and log all the boot numbers
         pre_analyze_totals = [
@@ -180,15 +187,15 @@ def test_subsequent_boot_of_upgraded_package(session_cloud: IntegrationCloud):
             pytest.fail(UNSUPPORTED_INSTALL_METHOD_MSG.format(source))
         else:
             pytest.skip(UNSUPPORTED_INSTALL_METHOD_MSG.format(source))
-        return  # type checking doesn't understand that skip raises
 
     launch_kwargs = {"image_id": session_cloud.initial_image_id}
 
     with session_cloud.launch(launch_kwargs=launch_kwargs) as instance:
-        instance.install_new_cloud_init(
-            source, take_snapshot=False, clean=False
-        )
+        instance.install_new_cloud_init(source, clean=False)
+        # Ensure we aren't looking at any prior warnings/errors from prior boot
+        instance.execute("rm /var/log/cloud-init.log")
         instance.restart()
         log = instance.read_from_file("/var/log/cloud-init.log")
         verify_clean_log(log)
         assert instance.execute("cloud-init status --wait --long").ok
+        verify_clean_boot(instance)

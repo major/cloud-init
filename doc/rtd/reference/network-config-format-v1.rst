@@ -3,7 +3,7 @@
 Networking config Version 1
 ***************************
 
-This network configuration format lets users customise their instance's
+This network configuration format lets users customize their instance's
 networking interfaces by assigning subnet configuration, virtual device
 creation (bonds, bridges, VLANs) routes and DNS configuration.
 
@@ -81,6 +81,13 @@ be sent in a packet- or frame-based network. Specifying ``mtu`` is optional.
    The possible supported values of a device's MTU are not available at
    configuration time. It's possible to specify a value too large or to
    small for a device, and may be ignored by the device.
+
+``accept-ra: <boolean>``
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+The ``accept-ra`` key is a boolean value that specifies whether or not to
+accept Router Advertisements (RA) for this interface. Specifying ``accept-ra``
+is optional.
 
 Physical example
 ^^^^^^^^^^^^^^^^
@@ -252,8 +259,7 @@ Users can specify a ``nameserver`` type. Nameserver dictionaries include
 the following keys:
 
 - ``address``: List of IPv4 or IPv6 address of nameservers.
-- ``search``: List of hostnames to include in the :file:`resolv.conf` search
-  path.
+- ``search``: Optional. List of hostnames to include in the search path.
 - ``interface``: Optional. Ties the nameserver definition to the specified
   interface. The value specified here must match the ``name`` of an interface
   defined in this config. If unspecified, this nameserver will be considered
@@ -296,11 +302,11 @@ Valid keys for ``subnets`` include the following:
   interface will be handled during boot.
 - ``address``: IPv4 or IPv6 address. It may include CIDR netmask notation.
 - ``netmask``: IPv4 subnet mask in dotted format or CIDR notation.
+- ``broadcast`` : IPv4 broadcast address in dotted format. This is
+  only rendered if :file:`/etc/network/interfaces` is used.
 - ``gateway``: IPv4 address of the default gateway for this subnet.
-- ``dns_nameservers``: Specify a list of IPv4 dns server IPs to end up in
-  :file:`resolv.conf`.
-- ``dns_search``: Specify a list of search paths to be included in
-  :file:`resolv.conf`.
+- ``dns_nameservers``: Specify a list of IPv4 DNS server IPs.
+- ``dns_search``: Specify a list of DNS search paths.
 - ``routes``: Specify a list of routes for a given interface.
 
 Subnet types are one of the following:
@@ -313,6 +319,7 @@ Subnet types are one of the following:
 - ``ipv6_dhcpv6-stateful``: Configure this interface with ``dhcp6``.
 - ``ipv6_dhcpv6-stateless``: Configure this interface with SLAAC and DHCP.
 - ``ipv6_slaac``: Configure address with SLAAC.
+- ``manual`` : Manual configure this interface.
 
 When making use of ``dhcp`` or either of the ``ipv6_dhcpv6`` types,
 no additional configuration is needed in the subnet dictionary.

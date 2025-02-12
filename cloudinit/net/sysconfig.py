@@ -6,7 +6,7 @@ import io
 import logging
 import os
 import re
-from typing import Mapping, Optional
+from typing import Dict, Optional
 
 from cloudinit import subp, util
 from cloudinit.distros.parsers import networkmanager_conf, resolv_conf
@@ -43,7 +43,7 @@ def _make_header(sep="#"):
         "Created by cloud-init automatically, do not edit.",
         "",
     ]
-    for i in range(0, len(lines)):
+    for i in range(len(lines)):
         if lines[i]:
             lines[i] = sep + " " + lines[i]
         else:
@@ -205,7 +205,7 @@ class Route(ConfigMap):
                 )
                 metric_key = "METRIC" + index
                 if metric_key in self._conf:
-                    metric_value = str(self._conf["METRIC" + index])
+                    metric_value = str(self._conf[metric_key])
                     buf.write(
                         "%s=%s\n"
                         % ("METRIC" + str(reindex), _quote_value(metric_value))
@@ -317,7 +317,6 @@ class Renderer(renderer.Renderer):
         "rhel": {
             "ONBOOT": True,
             "USERCTL": False,
-            "NM_CONTROLLED": False,
             "BOOTPROTO": "none",
         },
         "suse": {"BOOTPROTO": "static", "STARTMODE": "auto"},
@@ -549,7 +548,12 @@ class Renderer(renderer.Renderer):
             subnet_type = subnet.get("type")
             # metric may apply to both dhcp and static config
             if "metric" in subnet:
-                if flavor != "suse":
+                if flavor == "rhel":
+                    if subnet_is_ipv6(subnet):
+                        iface_cfg["IPV6_ROUTE_METRIC"] = subnet["metric"]
+                    else:
+                        iface_cfg["IPV4_ROUTE_METRIC"] = subnet["metric"]
+                elif flavor != "suse":
                     iface_cfg["METRIC"] = subnet["metric"]
             if subnet_type in ["dhcp", "dhcp4"]:
                 # On SUSE distros 'DHCLIENT_SET_DEFAULT_ROUTE' is a global
@@ -656,7 +660,17 @@ class Renderer(renderer.Renderer):
                             iface_cfg["GATEWAY"] = route["gateway"]
                             route_cfg.has_set_default_ipv4 = True
                     if "metric" in route:
-                        iface_cfg["METRIC"] = route["metric"]
+                        if flavor == "rhel":
+                            if subnet_is_ipv6(subnet):
+                                iface_cfg["IPV6_ROUTE_METRIC"] = route[
+                                    "metric"
+                                ]
+                            else:
+                                iface_cfg["IPV4_ROUTE_METRIC"] = route[
+                                    "metric"
+                                ]
+                        else:
+                            iface_cfg["METRIC"] = route["metric"]
 
                 else:
                     # add default routes only to ifcfg files, not
@@ -676,7 +690,7 @@ class Renderer(renderer.Renderer):
     @classmethod
     def _render_bonding_opts(cls, iface_cfg, iface, flavor):
         bond_opts = []
-        for (bond_key, value_tpl) in cls.bond_tpl_opts:
+        for bond_key, value_tpl in cls.bond_tpl_opts:
             # Seems like either dash or underscore is possible?
             bond_keys = [bond_key, bond_key.replace("_", "-")]
             for bond_key in bond_keys:
@@ -704,9 +718,10 @@ class Renderer(renderer.Renderer):
     def _render_physical_interfaces(
         cls, network_state, iface_contents, flavor
     ):
-        physical_filter = renderer.filter_by_physical
-        for iface in network_state.iter_interfaces(physical_filter):
-            iface_name = iface["name"]
+        for iface in network_state.iter_interfaces(
+            renderer.filter_by_type("physical")
+        ):
+            iface_name = iface.get("config_id") or iface["name"]
             iface_subnets = iface.get("subnets", [])
             iface_cfg = iface_contents[iface_name]
             route_cfg = iface_cfg.routes
@@ -825,20 +840,64 @@ class Renderer(renderer.Renderer):
 
     @staticmethod
     def _render_dns(network_state, existing_dns_path=None):
-        # skip writing resolv.conf if network_state doesn't include any input.
+
+        found_nameservers = []
+        found_dns_search = []
+
+        for iface in network_state.iter_interfaces():
+            for subnet in iface["subnets"]:
+                # Add subnet-level DNS
+                if "dns_nameservers" in subnet:
+                    found_nameservers.extend(subnet["dns_nameservers"])
+                if "dns_search" in subnet:
+                    found_dns_search.extend(subnet["dns_search"])
+
+            # Add interface-level DNS
+            if "dns" in iface:
+                found_nameservers += [
+                    dns
+                    for dns in iface["dns"]["nameservers"]
+                    if dns not in found_nameservers
+                ]
+                found_dns_search += [
+                    search
+                    for search in iface["dns"]["search"]
+                    if search not in found_dns_search
+                ]
+
+        # When both global and interface specific entries are present,
+        # use them both to generate /etc/resolv.conf eliminating duplicate
+        # entries. Otherwise use global or interface specific entries whichever
+        # is provided.
+        if network_state.dns_nameservers:
+            found_nameservers += [
+                nameserver
+                for nameserver in network_state.dns_nameservers
+                if nameserver not in found_nameservers
+            ]
+        if network_state.dns_searchdomains:
+            found_dns_search += [
+                search
+                for search in network_state.dns_searchdomains
+                if search not in found_dns_search
+            ]
+
+        # skip writing resolv.conf if no dns information is provided in conf.
         if not any(
             [
-                len(network_state.dns_nameservers),
-                len(network_state.dns_searchdomains),
+                len(found_nameservers),
+                len(found_dns_search),
             ]
         ):
             return None
         content = resolv_conf.ResolvConf("")
         if existing_dns_path and os.path.isfile(existing_dns_path):
-            content = resolv_conf.ResolvConf(util.load_file(existing_dns_path))
-        for nameserver in network_state.dns_nameservers:
+            content = resolv_conf.ResolvConf(
+                util.load_text_file(existing_dns_path)
+            )
+        for nameserver in found_nameservers:
             content.add_nameserver(nameserver)
-        for searchdomain in network_state.dns_searchdomains:
+        for searchdomain in found_dns_search:
             content.add_search_domain(searchdomain)
         header = _make_header(";")
         content_str = str(content)
@@ -848,26 +907,46 @@ class Renderer(renderer.Renderer):
 
     @staticmethod
     def _render_networkmanager_conf(network_state, templates=None):
+        iface_dns = False
         content = networkmanager_conf.NetworkManagerConf("")
+        # check if there is interface specific DNS information configured
+        for iface in network_state.iter_interfaces():
+            for subnet in iface["subnets"]:
+                if "dns_nameservers" in subnet or "dns_search" in subnet:
+                    iface_dns = True
+                    break
+            if (
+                not iface_dns
+                and "dns" in iface
+                and (iface["dns"]["nameservers"] or iface["dns"]["search"])
+            ):
+                iface_dns = True
+                break
 
-        # If DNS server information is provided, configure
-        # NetworkManager to not manage dns, so that /etc/resolv.conf
-        # does not get clobbered.
+        # If DNS server and/or dns search information is provided either
+        # globally or per interface basis, configure NetworkManager to
+        # not manage dns, so that /etc/resolv.conf does not get clobbered.
         # This is not required for NetworkManager renderer as it
         # does not write /etc/resolv.conf directly. DNS information is
         # written to the interface keyfile and NetworkManager is then
         # responsible for using the DNS information from the keyfile,
         # including managing /etc/resolv.conf.
-        if network_state.dns_nameservers:
+        if (
+            network_state.dns_nameservers
+            or network_state.dns_searchdomains
+            or iface_dns
+        ):
             content.set_section_keypair("main", "dns", "none")
 
-        if len(content) == 0:
+        if not content:
             return None
         out = "".join([_make_header(), "\n", "\n".join(content.write()), "\n"])
         return out
 
     @classmethod
-    def _render_bridge_interfaces(cls, network_state, iface_contents, flavor):
+    def _render_bridge_interfaces(
+        cls, network_state: NetworkState, iface_contents, flavor
+    ):
         bridge_key_map = {
             old_k: new_k
             for old_k, new_k in cls.cfg_key_maps[flavor].items()
@@ -948,23 +1027,29 @@ class Renderer(renderer.Renderer):
 
     @classmethod
     def _render_sysconfig(
-        cls, base_sysconf_dir, network_state, flavor, templates=None
+        cls,
+        base_sysconf_dir,
+        network_state: NetworkState,
+        flavor,
+        templates=None,
     ):
         """Given state, return /etc/sysconfig files + contents"""
         if not templates:
             templates = cls.templates
-        iface_contents: Mapping[str, NetInterface] = {}
+        iface_contents: Dict[str, NetInterface] = {}
         for iface in network_state.iter_interfaces():
             if iface["type"] == "loopback":
                 continue
-            iface_name = iface["name"]
-            iface_cfg = NetInterface(iface_name, base_sysconf_dir, templates)
+            config_id: str = iface.get("config_id") or iface["name"]
+            iface_cfg = NetInterface(
+                iface["name"], base_sysconf_dir, templates
+            )
             if flavor == "suse":
                 iface_cfg.drop("DEVICE")
                 # If type detection fails it is considered a bug in SUSE
                 iface_cfg.drop("TYPE")
             cls._render_iface_shared(iface, iface_cfg, flavor)
-            iface_contents[iface_name] = iface_cfg
+            iface_contents[config_id] = iface_cfg
         cls._render_physical_interfaces(network_state, iface_contents, flavor)
         cls._render_bond_interfaces(network_state, iface_contents, flavor)
         cls._render_vlan_interfaces(network_state, iface_contents, flavor)

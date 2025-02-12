@@ -10,6 +10,10 @@ import pytest
 import requests
 import responses
 
+# TODO: Importing `errors` here is a hack to avoid a circular import.
+# Without it, we have a azure->errors->identity->azure import loop, but
+# long term we should restructure these modules to avoid the issue.
+from cloudinit.sources.azure import errors as _errors  # noqa: F401
 from cloudinit.sources.azure import imds
 from cloudinit.url_helper import UrlError, readurl
 
@@ -56,8 +60,8 @@ def mock_requests_session_request():
 
 
 @pytest.fixture(autouse=True)
-def mock_time():
-    with mock.patch.object(imds, "time", autospec=True) as m:
+def mock_time_monotonic():
+    with mock.patch.object(imds, "monotonic", autospec=True) as m:
         m.time_current = 0.0
         m.time_increment = 1.0
 
@@ -129,6 +133,25 @@ def regex_for_http_error(error):
     return f".*{error!s}.*"
 
 
+class TestHeaders:
+    default_url = (
+        "http://169.254.169.254/metadata/instance?"
+        "api-version=2021-08-01&extended=true"
+    )
+
+    def test_headers_cb(self):
+        headers = imds.headers_cb(self.default_url)
+        assert list(headers.keys()) == ["Metadata", "x-ms-client-request-id"]
+        assert headers.get("Metadata") == "true"
+        uuid = headers.get("x-ms-client-request-id")
+        match = re.search(
+            "^[a-zA-Z0-9]{8}-[a-zA-Z0-9]{4}-[a-zA-Z0-9]{4}-"
+            "[a-zA-Z0-9]{4}-[a-zA-Z0-9]{12}$",
+            uuid,
+        )
+        assert match
+
+
 class TestFetchMetadataWithApiFallback:
     default_url = (
         "http://169.254.169.254/metadata/instance?"
@@ -140,7 +163,6 @@ class TestFetchMetadataWithApiFallback:
 
     # Early versions of responses do not appreciate the parameters...
     base_url = "http://169.254.169.254/metadata/instance"
-    headers = {"Metadata": "true"}
     timeout = 30
 
     @pytest.mark.parametrize("retry_deadline", [0.0, 1.0, 60.0])
@@ -168,7 +190,7 @@ class TestFetchMetadataWithApiFallback:
             mock.call(
                 self.default_url,
                 timeout=self.timeout,
-                headers=self.headers,
+                headers_cb=imds.headers_cb,
                 exception_cb=mock.ANY,
                 infinite=True,
                 log_req_resp=True,
@@ -213,7 +235,7 @@ class TestFetchMetadataWithApiFallback:
             mock.call(
                 self.default_url,
                 timeout=self.timeout,
-                headers=self.headers,
+                headers_cb=imds.headers_cb,
                 exception_cb=mock.ANY,
                 infinite=True,
                 log_req_resp=True,
@@ -221,7 +243,7 @@ class TestFetchMetadataWithApiFallback:
             mock.call(
                 self.fallback_url,
                 timeout=self.timeout,
-                headers=self.headers,
+                headers_cb=imds.headers_cb,
                 exception_cb=mock.ANY,
                 infinite=True,
                 log_req_resp=True,
@@ -232,11 +254,15 @@ class TestFetchMetadataWithApiFallback:
             (
                 "cloudinit.url_helper",
                 logging.DEBUG,
-                StringMatch(r"\[0/infinite\] open.*"),
+                StringMatch(
+                    r"\[0/infinite\] open.*Metadata.*true"
+                    ".*x-ms-client-request-id.*[a-zA-Z0-9]{8}-[a-zA-Z0-9]{4}-"
+                    "[a-zA-Z0-9]{4}-[a-zA-Z0-9]{4}-[a-zA-Z0-9]{12}.*"
+                ),
             ),
             (
                 LOG_PATH,
-                logging.INFO,
+                logging.WARNING,
                 StringMatch("Polling IMDS failed attempt 1 with.*400.*"),
             ),
             (
@@ -314,7 +340,7 @@ class TestFetchMetadataWithApiFallback:
             ),
             (
                 LOG_PATH,
-                logging.INFO,
+                logging.WARNING,
                 StringMatch(
                     "Polling IMDS failed attempt 1 with exception: "
                     f"{error_regex}"
@@ -377,7 +403,7 @@ class TestFetchMetadataWithApiFallback:
             ),
             (
                 LOG_PATH,
-                logging.INFO,
+                logging.WARNING,
                 StringMatch(
                     "Polling IMDS failed attempt 1 with exception:.*400.*"
                 ),
@@ -401,7 +427,7 @@ class TestFetchMetadataWithApiFallback:
             ),
             (
                 LOG_PATH,
-                logging.INFO,
+                logging.WARNING,
                 StringMatch(
                     "Polling IMDS failed attempt 1 with exception:.*429.*"
                 ),
@@ -479,7 +505,7 @@ class TestFetchMetadataWithApiFallback:
         assert logs == [
             (
                 LOG_PATH,
-                logging.INFO,
+                logging.WARNING,
                 StringMatch(
                     f"Polling IMDS failed attempt {i} with exception:"
                     f"{error_regex}"
@@ -535,7 +561,7 @@ class TestFetchMetadataWithApiFallback:
             ),
             (
                 LOG_PATH,
-                logging.INFO,
+                logging.WARNING,
                 StringMatch(
                     "Polling IMDS failed attempt 1 with exception:"
                     f".*{error_regex}"
@@ -575,7 +601,7 @@ class TestFetchMetadataWithApiFallback:
             mock.call(
                 self.default_url,
                 timeout=self.timeout,
-                headers=self.headers,
+                headers_cb=imds.headers_cb,
                 exception_cb=mock.ANY,
                 infinite=True,
                 log_req_resp=True,
@@ -639,7 +665,6 @@ class TestFetchReprovisionData:
         "http://169.254.169.254/metadata/"
         "reprovisiondata?api-version=2019-06-01"
     )
-    headers = {"Metadata": "true"}
     timeout = 30
 
     # Early versions of responses do not appreciate the parameters...
@@ -663,7 +688,7 @@ class TestFetchReprovisionData:
             mock.call(
                 self.url,
                 timeout=self.timeout,
-                headers=self.headers,
+                headers_cb=imds.headers_cb,
                 exception_cb=mock.ANY,
                 infinite=True,
                 log_req_resp=False,
@@ -722,7 +747,7 @@ class TestFetchReprovisionData:
         backoff_logs = [
             (
                 LOG_PATH,
-                logging.INFO,
+                logging.WARNING,
                 f"Polling IMDS failed attempt {i} with exception: "
                 f"{wrapped_error!r}",
             )
@@ -789,7 +814,7 @@ class TestFetchReprovisionData:
         backoff_logs = [
             (
                 LOG_PATH,
-                logging.INFO,
+                logging.WARNING,
                 f"Polling IMDS failed attempt {i} with exception: "
                 f"{wrapped_error!r}",
             )
@@ -799,7 +824,7 @@ class TestFetchReprovisionData:
         assert caplog.record_tuples == backoff_logs + [
             (
                 LOG_PATH,
-                logging.INFO,
+                logging.WARNING,
                 f"Polling IMDS failed attempt {failures+1} with exception: "
                 f"{exc_info.value!r}",
             ),
@@ -835,7 +860,7 @@ class TestFetchReprovisionData:
         assert caplog.record_tuples == [
             (
                 LOG_PATH,
-                logging.INFO,
+                logging.WARNING,
                 "Polling IMDS failed attempt 1 with exception: "
                 f"{exc_info.value!r}",
             ),

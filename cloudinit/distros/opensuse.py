@@ -15,7 +15,7 @@ from cloudinit import distros, helpers, subp, util
 from cloudinit.distros import PackageList
 from cloudinit.distros import rhel_util as rhutil
 from cloudinit.distros.parsers.hostname import HostnameConf
-from cloudinit.settings import PER_INSTANCE
+from cloudinit.settings import PER_ALWAYS, PER_INSTANCE
 
 LOG = logging.getLogger(__name__)
 
@@ -26,8 +26,6 @@ class Distro(distros.Distro):
     init_cmd = ["service"]
     locale_conf_fn = "/etc/sysconfig/language"
     network_conf_fn = "/etc/sysconfig/network/config"
-    network_script_tpl = "/etc/sysconfig/network/ifcfg-%s"
-    route_conf_tpl = "/etc/sysconfig/network/ifroute-%s"
     systemd_hostname_conf_fn = "/etc/hostname"
     systemd_locale_conf_fn = "/etc/locale.conf"
     tz_local_fn = "/etc/localtime"
@@ -150,17 +148,17 @@ class Distro(distros.Distro):
             # This ensures that the correct tz will be used for the system
             util.copy(tz_file, self.tz_local_fn)
 
-    def update_package_sources(self):
+    def update_package_sources(self, *, force=False):
         self._runner.run(
             "update-sources",
             self.package_command,
             ["refresh"],
-            freq=PER_INSTANCE,
+            freq=PER_ALWAYS if force else PER_INSTANCE,
         )
 
     def _read_hostname(self, filename, default=None):
         if self.uses_systemd() and filename.endswith("/previous-hostname"):
-            return util.load_file(filename).strip()
+            return util.load_text_file(filename).strip()
         elif self.uses_systemd():
             (out, _err) = subp.subp(["hostname"])
             if len(out):
@@ -181,7 +179,7 @@ class Distro(distros.Distro):
         return "127.0.1.1"
 
     def _read_hostname_conf(self, filename):
-        conf = HostnameConf(util.load_file(filename))
+        conf = HostnameConf(util.load_text_file(filename))
         conf.parse()
         return conf
 
@@ -200,7 +198,7 @@ class Distro(distros.Distro):
             if result:
                 (devpth, fs_type, mount_point) = result
                 # Check if the file system is read only
-                mounts = util.load_file("/proc/mounts").split("\n")
+                mounts = util.load_text_file("/proc/mounts").split("\n")
                 for mount in mounts:
                     if mount.startswith(devpth):
                         mount_info = mount.split()
@@ -248,6 +246,10 @@ class Distro(distros.Distro):
                 if create_hostname_file:
                     pass
                 else:
+                    LOG.info(
+                        "create_hostname_file is False; hostname file not"
+                        "created"
+                    )
                     return
             if not conf:
                 conf = HostnameConf("")

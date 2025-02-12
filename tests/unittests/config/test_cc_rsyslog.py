@@ -115,7 +115,7 @@ class TestApplyChanges(TestCase):
 
         fname = os.path.join(self.tmp, "foo.cfg")
         self.assertEqual([fname], changed)
-        self.assertEqual(util.load_file(fname), cfgline + "\n")
+        self.assertEqual(util.load_text_file(fname), cfgline + "\n")
 
     def test_multiple_files(self):
         configs = [
@@ -139,11 +139,11 @@ class TestApplyChanges(TestCase):
         self.assertEqual([f[0] for f in expected], changed)
         actual = []
         for fname, _content in expected:
-            util.load_file(fname)
+            util.load_text_file(fname)
             actual.append(
                 (
                     fname,
-                    util.load_file(fname),
+                    util.load_text_file(fname),
                 )
             )
         self.assertEqual(expected, actual)
@@ -159,7 +159,7 @@ class TestApplyChanges(TestCase):
         self.assertEqual([fname], changed)
 
         expected_content = "\n".join([c for c in configs]) + "\n"
-        found_content = util.load_file(fname)
+        found_content = util.load_text_file(fname)
         self.assertEqual(expected_content, found_content)
 
     def test_multiline_content(self):
@@ -171,7 +171,7 @@ class TestApplyChanges(TestCase):
 
         fname = os.path.join(self.tmp, "default.cfg")
         expected_content = "\n".join([c for c in configs])
-        found_content = util.load_file(fname)
+        found_content = util.load_text_file(fname)
         self.assertEqual(expected_content, found_content)
 
 
@@ -340,7 +340,7 @@ class TestInstallRsyslog(TestCase):
             with mock.patch.object(
                 cloud.distro, "install_packages"
             ) as m_install:
-                handle("rsyslog", {"rsyslog": config}, cloud, None)
+                handle("rsyslog", {"rsyslog": config}, cloud, [])
             m_which.assert_called_with(config["check_exe"])
             m_install.assert_called_with(config["packages"])
 
@@ -356,6 +356,6 @@ class TestInstallRsyslog(TestCase):
         m_isbsd.return_value = False
         m_which.return_value = "/usr/sbin/rsyslogd"
         with mock.patch.object(cloud.distro, "install_packages") as m_install:
-            handle("rsyslog", {"rsyslog": config}, cloud, None)
+            handle("rsyslog", {"rsyslog": config}, cloud, [])
         m_which.assert_called_with(config["check_exe"])
         m_install.assert_not_called()

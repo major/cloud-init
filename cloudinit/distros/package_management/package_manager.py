@@ -18,8 +18,11 @@ class PackageManager(ABC):
         return cls(runner)
 
     @abstractmethod
-    def update_package_sources(self):
-        ...
+    def available(self) -> bool:
+        """Return if package manager is installed on system."""
+
+    @abstractmethod
+    def update_package_sources(self, *, force=False): ...
 
     @abstractmethod
     def install_packages(self, pkglist: Iterable) -> UninstalledPackages:

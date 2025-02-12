@@ -3,14 +3,17 @@
 Performance
 ***********
 
-The :command:`analyze` subcommand was added to ``cloud-init`` to help analyze
-``cloud-init`` boot time performance. It is loosely based on
-``systemd-analyze``, where there are four subcommands:
+The :command:`analyze` subcommand helps to analyze ``cloud-init`` boot time
+performance. It is loosely based on ``systemd-analyze``, where there are four
+subcommands:
 
 - :command:`blame`
 - :command:`show`
 - :command:`dump`
 - :command:`boot`
+
+The analyze subcommand works by parsing the cloud-init log file for timestamps
+associated with specific events.
 
 Usage
 =====
@@ -78,11 +81,10 @@ Example output:
         00.00100s (modules-final/config-scripts_vendor)
         00.00100s (modules-final/config-scripts_per_once)
         00.00100s (modules-final/config-salt_minion)
-        00.00100s (modules-final/config-rightscale_userdata)
         00.00100s (modules-final/config-phone_home)
         00.00100s (modules-final/config-package_update_upgrade_install)
         00.00100s (modules-final/config-fan)
-        00.00100s (modules-config/config-ubuntu_advantage)
+        00.00100s (modules-config/config-ubuntu_pro)
         00.00100s (modules-config/config-ssh_import_id)
         00.00100s (modules-config/config-snap)
         00.00100s (modules-config/config-set_passwords)
@@ -92,7 +94,6 @@ Example output:
         00.00100s (modules-config/config-apt_pipelining)
         00.00100s (init-network/config-write_files)
         00.00100s (init-network/config-seed_random)
-        00.00100s (init-network/config-migrator)
         00.00000s (modules-final/config-ubuntu_drivers)
         00.00000s (modules-final/config-scripts_user)
         00.00000s (modules-final/config-scripts_per_instance)
@@ -323,7 +324,7 @@ Example output:
    UserspaceTimestampMonotonic=989279
 
 The ``UserspaceTimestamp`` tracks when the init system starts, which is used
-as an indicator of the kernel finishing initialisation.
+as an indicator of the kernel finishing initialization.
 
 Running the following command will gather the ``InactiveExitTimestamp``:
 

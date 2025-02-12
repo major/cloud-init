@@ -1,5 +1,5 @@
 from contextlib import suppress
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 import pytest
 
@@ -17,7 +17,7 @@ class TestDataSourceAkamai:
     """
 
     def _get_datasource(
-        self, ds_cfg: Dict[str, Any] = None, local: bool = False
+        self, ds_cfg: Optional[Dict[str, Any]] = None, local: bool = False
     ) -> Union[DataSourceAkamai, DataSourceAkamaiLocal]:
         """
         Creates a test DataSource configured as provided
@@ -38,9 +38,9 @@ class TestDataSourceAkamai:
             return_value="",
         ):
             if local:
-                ds: Union[
-                    DataSourceAkamai, DataSourceAkamaiLocal
-                ] = DataSourceAkamaiLocal(sys_cfg, None, None)
+                ds: Union[DataSourceAkamai, DataSourceAkamaiLocal] = (
+                    DataSourceAkamaiLocal(sys_cfg, None, None)
+                )
             else:
                 ds = DataSourceAkamai(sys_cfg, None, None)
 
@@ -224,7 +224,7 @@ class TestDataSourceAkamai:
         get_interfaces_by_mac,
         local_stage: bool,
         ds_cfg: Dict[str, Any],
-        expected_manager_config: List[Tuple[Tuple[bool, bool], bool]],
+        expected_manager_config: List,
         expected_interface: str,
     ):
         """
@@ -261,14 +261,43 @@ class TestDataSourceAkamai:
                 assert rv6 == ev6
 
     @pytest.mark.parametrize(
-        "use_v6",
+        "use_v6,userdata,decoded_userdata,case",
         (
-            False,
-            True,
+            (
+                False,
+                "dGVzdGluZyBlbmNvZGVkIHVzZXJkYXRh",
+                b"testing encoded userdata",
+                "base64-encoded ASCII plaintext, IPv4 request",
+            ),
+            (
+                True,
+                "dGVzdGluZyBlbmNvZGVkIHVzZXJkYXRh",
+                b"testing encoded userdata",
+                "base64-encoded ASCII plaintext, IPv6 request",
+            ),
+            (
+                False,
+                "H4sIAAAAAAACAytJLS7hAgDGNbk7BQAAAA==",
+                b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03+I-.\xe1\x02\x00\xc65\xb9;\x05\x00\x00\x00",
+                "base64-encoded gzipped data",
+            ),
+            (
+                False,
+                "dGVzdDHwn4yKdGVzdDI=",
+                "test1\N{WATER WAVE}test2".encode("utf-8"),
+                "base64-encoded Unicode text",
+            ),
         ),
     )
     @mock.patch("cloudinit.url_helper.readurl")
-    def test_fetch_metadata(self, readurl, use_v6: bool):
+    def test_fetch_metadata(
+        self,
+        readurl,
+        use_v6: bool,
+        userdata: str,
+        decoded_userdata: str,
+        case: str,
+    ):
         """
         Tests that making requests sends the expected requests in the expected
         order
@@ -280,7 +309,7 @@ class TestDataSourceAkamai:
             # to GET /v1/instance; truncated for brevity
             '{"id": 123}',
             # to GET /v1/user-data
-            "",
+            userdata,
         ]
 
         # if we're asked to force using v6, we should see the hostname of the
@@ -292,7 +321,7 @@ class TestDataSourceAkamai:
 
         assert readurl.call_count == 3
         assert ds.metadata == {"id": 123}
-        assert ds.userdata_raw == ""
+        assert ds.userdata_raw == decoded_userdata, f"Failed to decode {case}"
 
         assert readurl.mock_calls == [
             mock.call(

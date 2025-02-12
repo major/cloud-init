@@ -24,12 +24,11 @@ class Config:
     RESETPASS = "PASSWORD|RESET"
     SUFFIX = "DNS|SUFFIX|"
     TIMEZONE = "DATETIME|TIMEZONE"
-    UTC = "DATETIME|UTC"
     POST_GC_STATUS = "MISC|POST-GC-STATUS"
     DEFAULT_RUN_POST_SCRIPT = "MISC|DEFAULT-RUN-POST-CUST-SCRIPT"
     CLOUDINIT_META_DATA = "CLOUDINIT|METADATA"
     CLOUDINIT_USER_DATA = "CLOUDINIT|USERDATA"
-    CLOUDINIT_INSTANCE_ID = "CLOUDINIT|INSTANCE-ID"
+    CLOUDINIT_INSTANCE_ID = "MISC|INSTANCE-ID"
 
     def __init__(self, configFile):
         self._configFile = configFile
@@ -88,7 +87,7 @@ class Config:
 
     @property
     def reset_password(self):
-        """Retreives if the root password needs to be reset."""
+        """Retrieves if the root password needs to be reset."""
         resetPass = self._configFile.get(Config.RESETPASS, "no")
         resetPass = resetPass.lower()
         if resetPass not in ("yes", "no"):

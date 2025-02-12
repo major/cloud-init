@@ -14,7 +14,6 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
-import requests
 import responses
 
 from cloudinit import handlers
@@ -23,7 +22,7 @@ from cloudinit import safeyaml, stages
 from cloudinit import user_data as ud
 from cloudinit import util
 from cloudinit.config.modules import Modules
-from cloudinit.settings import PER_INSTANCE
+from cloudinit.settings import DEFAULT_RUN_DIR, PER_INSTANCE
 from tests.unittests import helpers
 from tests.unittests.util import FakeDataSource
 
@@ -82,7 +81,9 @@ class TestConsumeUserData:
         init_tmp.fetch()
         with mock.patch.object(init_tmp, "_reset"):
             init_tmp.consume_data()
-        cc_contents = util.load_file(init_tmp.paths.get_ipath("cloud_config"))
+        cc_contents = util.load_text_file(
+            init_tmp.paths.get_ipath("cloud_config")
+        )
         cc = util.load_yaml(cc_contents)
         assert len(cc) == 2
         assert cc["baz"] == "qux"
@@ -215,7 +216,9 @@ c: d
         init_tmp.fetch()
         with mock.patch.object(init_tmp, "_reset"):
             init_tmp.consume_data()
-        cc_contents = util.load_file(init_tmp.paths.get_ipath("cloud_config"))
+        cc_contents = util.load_text_file(
+            init_tmp.paths.get_ipath("cloud_config")
+        )
         cc = util.load_yaml(cc_contents)
         assert len(cc) == 1
         assert cc["a"] == "c"
@@ -248,7 +251,9 @@ c: d
         init_tmp.fetch()
         with mock.patch.object(init_tmp, "_reset"):
             init_tmp.consume_data()
-        cc_contents = util.load_file(init_tmp.paths.get_ipath("cloud_config"))
+        cc_contents = util.load_text_file(
+            init_tmp.paths.get_ipath("cloud_config")
+        )
         cc = util.load_yaml(cc_contents)
         assert len(cc) == 1
         assert cc["a"] == "c"
@@ -356,9 +361,9 @@ run:
  - morestuff
 """
         message2 = MIMEBase("text", "cloud-config")
-        message2[
-            "X-Merge-Type"
-        ] = "dict(recurse_array,recurse_str)+list(append)+str(append)"
+        message2["X-Merge-Type"] = (
+            "dict(recurse_array,recurse_str)+list(append)+str(append)"
+        )
         message2.set_payload(blob2)
 
         blob3 = """
@@ -392,7 +397,7 @@ p: 1
         cloud_cfg.handle_part(
             None, handlers.CONTENT_END, None, None, None, None
         )
-        contents = util.load_file(paths.get_ipath("cloud_config"))
+        contents = util.load_text_file(paths.get_ipath("cloud_config"))
         contents = util.load_yaml(contents)
         assert contents["run"], ["b", "c", "stuff", "morestuff"]
         assert contents["a"] == "be"
@@ -441,7 +446,9 @@ c: 4
         init_tmp.fetch()
         with mock.patch.object(init_tmp, "_reset"):
             init_tmp.consume_data()
-        contents = util.load_file(init_tmp.paths.get_ipath("cloud_config"))
+        contents = util.load_text_file(
+            init_tmp.paths.get_ipath("cloud_config")
+        )
         contents = util.load_yaml(contents)
         assert isinstance(contents, dict) is True
         assert len(contents) == 3
@@ -474,6 +481,7 @@ c: 4
         ALLOW_EC2_MIRRORS_ON_NON_AWS_INSTANCE_TYPES=True,
         EXPIRE_APPLIES_TO_HASHED_USERS=False,
         NETPLAN_CONFIG_ROOT_READ_ONLY=True,
+        DEPRECATION_INFO_BOUNDARY="devel",
         NOCLOUD_SEED_URL_APPEND_FORWARD_SLASH=False,
         APT_DEB822_SOURCE_LIST_FILE=True,
     )
@@ -505,8 +513,10 @@ c: 4
                 "ALLOW_EC2_MIRRORS_ON_NON_AWS_INSTANCE_TYPES": True,
                 "EXPIRE_APPLIES_TO_HASHED_USERS": False,
                 "NETPLAN_CONFIG_ROOT_READ_ONLY": True,
+                "DEPRECATION_INFO_BOUNDARY": "devel",
                 "NOCLOUD_SEED_URL_APPEND_FORWARD_SLASH": False,
                 "APT_DEB822_SOURCE_LIST_FILE": True,
+                "MANUAL_NETWORK_WAIT": True,
             },
             "system_info": {
                 "default_user": {"name": "ubuntu"},
@@ -519,7 +529,7 @@ c: 4
         }
 
         loaded_json = util.load_json(
-            util.load_file(
+            util.load_text_file(
                 init_tmp.paths.get_runpath("instance_data_sensitive")
             )
         )
@@ -527,7 +537,9 @@ c: 4
 
         expected["_doc"] = stages.COMBINED_CLOUD_CONFIG_DOC
         assert expected == util.load_json(
-            util.load_file(init_tmp.paths.get_runpath("combined_cloud_config"))
+            util.load_text_file(
+                init_tmp.paths.get_runpath("combined_cloud_config")
+            )
         )
 
     def test_mime_text_x_shellscript(self, init_tmp, caplog):
@@ -685,7 +697,9 @@ class TestConsumeUserDataHttp:
         with mock.patch.object(init_tmp, "_reset") as _reset:
             init_tmp.consume_data()
             assert _reset.call_count == 1
-        cc_contents = util.load_file(init_tmp.paths.get_ipath("cloud_config"))
+        cc_contents = util.load_text_file(
+            init_tmp.paths.get_ipath("cloud_config")
+        )
         cc = util.load_yaml(cc_contents)
         assert cc.get("included") is True
 
@@ -711,7 +725,7 @@ class TestConsumeUserDataHttp:
                 assert _reset.call_count == 1
 
         with pytest.raises(FileNotFoundError):
-            util.load_file(init_tmp.paths.get_ipath("cloud_config"))
+            util.load_text_file(init_tmp.paths.get_ipath("cloud_config"))
 
     @responses.activate
     @mock.patch("cloudinit.url_helper.time.sleep")
@@ -728,9 +742,7 @@ class TestConsumeUserDataHttp:
         responses.add(
             responses.GET,
             bad_url,
-            body=requests.HTTPError(
-                f"403 Client Error: Forbidden for url: {bad_url}"
-            ),
+            body="forbidden",
             status=403,
         )
 
@@ -750,7 +762,9 @@ class TestConsumeUserDataHttp:
             "403 Client Error: Forbidden for url: %s" % bad_url in caplog.text
         )
 
-        cc_contents = util.load_file(init_tmp.paths.get_ipath("cloud_config"))
+        cc_contents = util.load_text_file(
+            init_tmp.paths.get_ipath("cloud_config")
+        )
         cc = util.load_yaml(cc_contents)
         assert cc.get("bad") is None
         assert cc.get("included") is True
@@ -812,7 +826,7 @@ class TestFetchBaseConfig:
     def test_only_builtin_gets_builtin(self, mocker):
         mocker.patch(f"{MPATH}.read_runtime_config", return_value={})
         mocker.patch(f"{MPATH}.util.read_conf_with_confd")
-        config = stages.fetch_base_config()
+        config = stages.fetch_base_config(DEFAULT_RUN_DIR)
         assert util.get_builtin_cfg() == config
 
     def test_conf_d_overrides_defaults(self, mocker):
@@ -825,7 +839,7 @@ class TestFetchBaseConfig:
             return_value={test_key: test_value},
         )
         mocker.patch(f"{MPATH}.read_runtime_config", return_value={})
-        config = stages.fetch_base_config()
+        config = stages.fetch_base_config(DEFAULT_RUN_DIR)
         assert config.get(test_key) == test_value
         builtin[test_key] = test_value
         assert config == builtin
@@ -839,7 +853,7 @@ class TestFetchBaseConfig:
         mocker.patch("cloudinit.stages.CLOUD_CONFIG", cfg_path)
         mocker.patch(f"{MPATH}.util.get_builtin_cfg", return_value={})
         config = stages.fetch_base_config(
-            instance_data_file=instance_data_path
+            DEFAULT_RUN_DIR, instance_data_file=instance_data_path
         )
         assert config == {"key": "template_value"}
 
@@ -855,7 +869,7 @@ class TestFetchBaseConfig:
             return_value=cmdline,
         )
         mocker.patch(f"{MPATH}.read_runtime_config")
-        config = stages.fetch_base_config()
+        config = stages.fetch_base_config(DEFAULT_RUN_DIR)
         assert config.get(test_key) == test_value
         builtin[test_key] = test_value
         assert config == builtin
@@ -874,7 +888,7 @@ class TestFetchBaseConfig:
             return_value=cmdline,
         )
 
-        config = stages.fetch_base_config()
+        config = stages.fetch_base_config(DEFAULT_RUN_DIR)
         assert config == {"key1": "value1", "key2": "other2", "key3": "other3"}
 
     def test_order_precedence_is_builtin_system_runtime_cmdline(self, mocker):
@@ -891,7 +905,7 @@ class TestFetchBaseConfig:
         )
         mocker.patch(f"{MPATH}.read_runtime_config", return_value=runtime)
 
-        config = stages.fetch_base_config()
+        config = stages.fetch_base_config(DEFAULT_RUN_DIR)
 
         assert config == {
             "key1": "cmdline1",

@@ -18,7 +18,6 @@ LOG = logging.getLogger(__name__)
 
 MD_V1_URL = "http://metadata.google.internal/computeMetadata/v1/"
 BUILTIN_DS_CONFIG = {"metadata_url": MD_V1_URL}
-REQUIRED_FIELDS = ("instance-id", "availability-zone", "local-hostname")
 GUEST_ATTRIBUTES_URL = (
     "http://metadata.google.internal/computeMetadata/"
     "v1/instance/guest-attributes"
@@ -88,6 +87,7 @@ class DataSourceGCE(sources.DataSource):
 
     def _get_data(self):
         url_params = self.get_url_params()
+        ret = {}
         if self.perform_dhcp_setup:
             candidate_nics = net.find_candidate_nics()
             if DEFAULT_PRIMARY_INTERFACE in candidate_nics:
@@ -105,14 +105,9 @@ class DataSourceGCE(sources.DataSource):
                 try:
                     with network_context:
                         try:
-                            ret = util.log_time(
-                                LOG.debug,
-                                "Crawl of GCE metadata service",
-                                read_md,
-                                kwargs={
-                                    "address": self.metadata_address,
-                                    "url_params": url_params,
-                                },
+                            ret = read_md(
+                                address=self.metadata_address,
+                                url_params=url_params,
                             )
                         except Exception as e:
                             LOG.debug(
@@ -122,39 +117,34 @@ class DataSourceGCE(sources.DataSource):
                             )
                             continue
                 except NoDHCPLeaseError:
+                    LOG.debug(
+                        "Unable to obtain a DHCP lease for %s", candidate_nic
+                    )
                     continue
                 if ret["success"]:
-                    self._fallback_interface = candidate_nic
+                    self.distro.fallback_interface = candidate_nic
                     LOG.debug("Primary NIC found: %s.", candidate_nic)
                     break
-            if self._fallback_interface is None:
+            if self.distro.fallback_interface is None:
                 LOG.warning(
                     "Did not find a fallback interface on %s.", self.cloud_name
                 )
         else:
-            ret = util.log_time(
-                LOG.debug,
-                "Crawl of GCE metadata service",
-                read_md,
-                kwargs={
-                    "address": self.metadata_address,
-                    "url_params": url_params,
-                },
-            )
+            ret = read_md(address=self.metadata_address, url_params=url_params)
 
-        if not ret["success"]:
-            if ret["platform_reports_gce"]:
-                LOG.warning(ret["reason"])
+        if not ret.get("success"):
+            if ret.get("platform_reports_gce"):
+                LOG.warning(ret.get("reason"))
             else:
-                LOG.debug(ret["reason"])
+                LOG.debug(ret.get("reason"))
             return False
-        self.metadata = ret["meta-data"]
-        self.userdata_raw = ret["user-data"]
+        self.metadata = ret.get("meta-data")
+        self.userdata_raw = ret.get("user-data")
         return True
 
     @property
     def launch_index(self):
-        # GCE does not provide lauch_index property.
+        # GCE does not provide launch_index property.
         return None
 
     def get_instance_id(self):
@@ -222,19 +212,19 @@ def _has_expired(public_key):
     except ValueError:
         return False
 
-    # Do not expire keys if there is no expriation timestamp.
+    # Do not expire keys if there is no expiration timestamp.
     if "expireOn" not in json_obj:
         return False
 
     expire_str = json_obj["expireOn"]
-    format_str = "%Y-%m-%dT%H:%M:%S+0000"
+    format_str = "%Y-%m-%dT%H:%M:%S%z"
     try:
         expire_time = datetime.datetime.strptime(expire_str, format_str)
     except ValueError:
         return False
 
     # Expire the key if and only if we have exceeded the expiration timestamp.
-    return datetime.datetime.utcnow() > expire_time
+    return datetime.datetime.now(datetime.timezone.utc) > expire_time
 
 
 def _parse_public_keys(public_keys_data, default_user=None):
@@ -293,7 +283,7 @@ def read_md(address=None, url_params=None, platform_check=True):
     )
     md = {}
     # Iterate over url_map keys to get metadata items.
-    for (mkey, paths, required, is_text, is_recursive) in url_map:
+    for mkey, paths, required, is_text, is_recursive in url_map:
         value = None
         for path in paths:
             new_value = metadata_fetcher.get_value(path, is_text, is_recursive)

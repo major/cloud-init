@@ -6,13 +6,14 @@ import base64
 import csv
 import logging
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from io import StringIO
 from typing import Any, Dict, List, Optional, Tuple
+from xml.etree import ElementTree as ET  # nosec B405
 
 import requests
 
-from cloudinit import version
+from cloudinit import subp, version
 from cloudinit.sources.azure import identity
 from cloudinit.url_helper import UrlError
 
@@ -51,7 +52,7 @@ class ReportableError(Exception):
         else:
             self.supporting_data = {}
 
-        self.timestamp = datetime.utcnow()
+        self.timestamp = datetime.now(timezone.utc)
 
         try:
             self.vm_id = identity.query_vm_id()
@@ -150,11 +151,35 @@ class ReportableErrorImdsUrlError(ReportableError):
         self.supporting_data["url"] = exception.url
 
 
+class ReportableErrorImdsInvalidMetadata(ReportableError):
+    def __init__(self, *, key: str, value: Any) -> None:
+        super().__init__(f"invalid IMDS metadata for key={key}")
+
+        self.supporting_data["key"] = key
+        self.supporting_data["value"] = repr(value)
+
+
 class ReportableErrorImdsMetadataParsingException(ReportableError):
     def __init__(self, *, exception: ValueError) -> None:
         super().__init__("error parsing IMDS metadata")
 
         self.supporting_data["exception"] = repr(exception)
+
+
+class ReportableErrorOsDiskPpsFailure(ReportableError):
+    def __init__(self) -> None:
+        super().__init__("error waiting for host shutdown")
+
+
+class ReportableErrorOvfInvalidMetadata(ReportableError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f"unexpected metadata parsing ovf-env.xml: {message}")
+
+
+class ReportableErrorOvfParsingException(ReportableError):
+    def __init__(self, *, exception: ET.ParseError) -> None:
+        message = exception.msg
+        super().__init__(f"error parsing ovf-env.xml: {message}")
 
 
 class ReportableErrorUnhandledException(ReportableError):
@@ -172,9 +197,15 @@ class ReportableErrorUnhandledException(ReportableError):
         self.supporting_data["traceback_base64"] = trace_base64
 
 
-class ReportableErrorImdsInvalidMetadata(ReportableError):
-    def __init__(self, *, key: str, value: Any) -> None:
-        super().__init__(f"invalid IMDS metadata for key={key}")
+class ReportableErrorProxyAgentNotFound(ReportableError):
+    def __init__(self) -> None:
+        super().__init__("azure-proxy-agent not found")
 
-        self.supporting_data["key"] = key
-        self.supporting_data["value"] = repr(value)
+
+class ReportableErrorProxyAgentStatusFailure(ReportableError):
+    def __init__(self, exception: subp.ProcessExecutionError) -> None:
+        super().__init__("azure-proxy-agent status failure")
+
+        self.supporting_data["exit_code"] = exception.exit_code
+        self.supporting_data["stdout"] = exception.stdout
+        self.supporting_data["stderr"] = exception.stderr

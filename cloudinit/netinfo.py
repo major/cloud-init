@@ -13,8 +13,9 @@ import logging
 import re
 from copy import copy, deepcopy
 from ipaddress import IPv4Network
+from typing import Dict, List, TypedDict
 
-from cloudinit import subp, util
+from cloudinit import lifecycle, subp, util
 from cloudinit.net.network_state import net_prefix_to_ipv4_mask
 from cloudinit.simpletable import SimpleTable
 
@@ -38,6 +39,13 @@ LOG = logging.getLogger(__name__)
 #         'ipv6': [{'ip': '::1/128', 'scope6': 'host'}],
 #         'up': True}}
 DEFAULT_NETDEV_INFO = {"ipv4": [], "ipv6": [], "hwaddr": "", "up": False}
+
+
+class Interface(TypedDict):
+    up: bool
+    hwaddr: str
+    ipv4: List[dict]
+    ipv6: List[dict]
 
 
 def _netdev_info_iproute_json(ipaddr_json):
@@ -94,7 +102,7 @@ def _netdev_info_iproute_json(ipaddr_json):
     return devs
 
 
-@util.deprecate_call(
+@lifecycle.deprecate_call(
     deprecated_version="22.1",
     extra_message="Required by old iproute2 versions that don't "
     "support ip json output. Consider upgrading to a more recent version.",
@@ -181,7 +189,7 @@ def _netdev_info_ifconfig_netbsd(ifconfig_data):
     # fields that need to be returned in devs for each dev
     devs = {}
     for line in ifconfig_data.splitlines():
-        if len(line) == 0:
+        if not line:
             continue
         if line[0] not in ("\t", " "):
             curdev = line.split()[0]
@@ -229,7 +237,7 @@ def _netdev_info_ifconfig(ifconfig_data):
     # fields that need to be returned in devs for each dev
     devs = {}
     for line in ifconfig_data.splitlines():
-        if len(line) == 0:
+        if not line:
             continue
         if line[0] not in ("\t", " "):
             curdev = line.split()[0]
@@ -282,7 +290,45 @@ def _netdev_info_ifconfig(ifconfig_data):
     return devs
 
 
-def netdev_info(empty=""):
+def netdev_info(
+    empty="",
+) -> Dict[str, Dict[str, Interface]]:
+    """return the instance's interfaces and interface data
+
+    includes, interface name, link state, hardware address, and lists of ipv4
+    and ipv6 addresses
+
+    example output:
+    {
+    'lo': {
+        'up': True,
+        'hwaddr': '',
+        'ipv4': [
+        {
+            'bcast': '',
+            'ip': '127.0.0.1',
+            'mask': '255.0.0.0',
+            'scope': 'host',
+        }],
+        'ipv6': [{'ip': '::1/128', 'scope6': 'host'}],
+    },
+    'lxdbr0': {
+        'up': True
+        'hwaddr': '00:16:3e:fa:84:30',
+        'ipv4': [{
+            'bcast': '',
+            'ip': '10.161.80.1',
+            'mask': '255.255.255.0',
+            'scope': 'global',
+        }],
+        'ipv6': [
+            {'ip': 'fd42:80e2:4695:1e96::1/64', 'scope6': 'global'},
+            {'ip': 'fe80::216:3eff:fefa:8430/64', 'scope6': 'link'},
+        ]
+    },
+    }
+
+    """
     devs = {}
     if util.is_NetBSD():
         (ifcfg_out, _err) = subp.subp(["ifconfig", "-a"], rcs=[0, 1])
@@ -540,8 +586,9 @@ def netdev_pformat():
             return "\n"
         fields = ["Device", "Up", "Address", "Mask", "Scope", "Hw-Address"]
         tbl = SimpleTable(fields)
-        for (dev, data) in sorted(netdev.items()):
-            for addr in data.get("ipv4"):
+        for dev, data in sorted(netdev.items()):
+            ipv4_addrs = data.get("ipv4")
+            for addr in ipv4_addrs:
                 tbl.add_row(
                     (
                         dev,
@@ -552,7 +599,9 @@ def netdev_pformat():
                         data["hwaddr"],
                     )
                 )
-            for addr in data.get("ipv6"):
+
+            ipv6_addrs = data.get("ipv6")
+            for addr in ipv6_addrs:
                 tbl.add_row(
                     (
                         dev,
@@ -563,7 +612,7 @@ def netdev_pformat():
                         data["hwaddr"],
                     )
                 )
-            if len(data.get("ipv6")) + len(data.get("ipv4")) == 0:
+            if not (ipv4_addrs) and not (ipv6_addrs):
                 tbl.add_row(
                     (dev, data["up"], empty, empty, empty, data["hwaddr"])
                 )
@@ -596,7 +645,7 @@ def route_pformat():
                 "Flags",
             ]
             tbl_v4 = SimpleTable(fields_v4)
-            for (n, r) in enumerate(routes.get("ipv4")):
+            for n, r in enumerate(routes.get("ipv4")):
                 route_id = str(n)
                 try:
                     tbl_v4.add_row(
@@ -624,7 +673,7 @@ def route_pformat():
                 "Flags",
             ]
             tbl_v6 = SimpleTable(fields_v6)
-            for (n, r) in enumerate(routes.get("ipv6")):
+            for n, r in enumerate(routes.get("ipv6")):
                 route_id = str(n)
                 if r["iface"] == "lo":
                     continue

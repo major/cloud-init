@@ -11,15 +11,15 @@ import os
 import os.path
 import re
 import socket
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as ET  # nosec B405
 from enum import Enum
 from pathlib import Path
-from time import sleep, time
+from time import monotonic, sleep, time
 from typing import Any, Dict, List, Optional
 
 import requests
 
-from cloudinit import net, sources, ssh_util, subp, util
+from cloudinit import net, performance, sources, ssh_util, subp, util
 from cloudinit.event import EventScope, EventType
 from cloudinit.net import device_driver
 from cloudinit.net.dhcp import (
@@ -33,7 +33,6 @@ from cloudinit.sources.azure import errors, identity, imds, kvp
 from cloudinit.sources.helpers import netlink
 from cloudinit.sources.helpers.azure import (
     DEFAULT_WIRESERVER_ENDPOINT,
-    BrokenAzureDataSource,
     NonAzureDataSource,
     OvfEnvXml,
     azure_ds_reporter,
@@ -41,24 +40,23 @@ from cloudinit.sources.helpers.azure import (
     build_minimal_ovf,
     dhcp_log_cb,
     get_boot_telemetry,
-    get_ip_from_lease_value,
     get_metadata_from_fabric,
     get_system_info,
-    push_log_to_kvp,
     report_diagnostic_event,
+    report_dmesg_to_kvp,
     report_failure_to_fabric,
 )
 from cloudinit.url_helper import UrlError
 
 try:
-    import crypt
+    import crypt  # pylint: disable=W4901
 
     blowfish_hash: Any = functools.partial(
         crypt.crypt, salt=f"$6${util.rand_str(strlen=16)}"
     )
 except (ImportError, AttributeError):
     try:
-        import passlib
+        import passlib.hash
 
         blowfish_hash = passlib.hash.sha512_crypt.hash
     except ImportError:
@@ -305,7 +303,6 @@ BUILTIN_CLOUD_EPHEMERAL_DISK_CONFIG = {
 
 DS_CFG_PATH = ["datasource", DS_NAME]
 DS_CFG_KEY_PRESERVE_NTFS = "never_destroy_ntfs"
-DEF_EPHEMERAL_LABEL = "Temporary Storage"
 
 # The redacted password fails to meet password complexity requirements
 # so we can safely use this to mask/redact the password in the ovf-env.xml
@@ -313,7 +310,6 @@ DEF_PASSWD_REDACTION = "REDACTED"
 
 
 class DataSourceAzure(sources.DataSource):
-
     dsname = "Azure"
     default_update_events = {
         EventScope.NETWORK: {
@@ -335,7 +331,7 @@ class DataSourceAzure(sources.DataSource):
         )
         self._iso_dev = None
         self._network_config = None
-        self._ephemeral_dhcp_ctx = None
+        self._ephemeral_dhcp_ctx: Optional[EphemeralDHCPv4] = None
         self._route_configured_for_imds = False
         self._route_configured_for_wireserver = False
         self._wireserver_endpoint = DEFAULT_WIRESERVER_ENDPOINT
@@ -430,8 +426,8 @@ class DataSourceAzure(sources.DataSource):
             dhcp_log_func=dhcp_log_cb,
         )
 
-        lease = None
-        start_time = time()
+        lease: Optional[Dict[str, Any]] = None
+        start_time = monotonic()
         deadline = start_time + timeout_minutes * 60
         with events.ReportEventStack(
             name="obtain-dhcp-lease",
@@ -448,7 +444,7 @@ class DataSourceAzure(sources.DataSource):
                     )
                     self._report_failure(
                         errors.ReportableErrorDhcpInterfaceNotFound(
-                            duration=time() - start_time
+                            duration=monotonic() - start_time
                         ),
                         host_only=True,
                     )
@@ -467,7 +463,7 @@ class DataSourceAzure(sources.DataSource):
                     )
                     self._report_failure(
                         errors.ReportableErrorDhcpLease(
-                            duration=time() - start_time, interface=iface
+                            duration=monotonic() - start_time, interface=iface
                         ),
                         host_only=True,
                     )
@@ -486,7 +482,7 @@ class DataSourceAzure(sources.DataSource):
                     )
 
                 # Sleep before retrying, otherwise break if past deadline.
-                if lease is None and time() + retry_sleep < deadline:
+                if lease is None and monotonic() + retry_sleep < deadline:
                     sleep(retry_sleep)
                 else:
                     break
@@ -501,9 +497,7 @@ class DataSourceAzure(sources.DataSource):
 
             # Update wireserver IP from DHCP options.
             if "unknown-245" in lease:
-                self._wireserver_endpoint = get_ip_from_lease_value(
-                    lease["unknown-245"]
-                )
+                self._wireserver_endpoint = lease["unknown-245"]
 
             driver = device_driver(iface)
             ephipv4 = self._ephemeral_dhcp_ctx._ephipv4
@@ -558,6 +552,60 @@ class DataSourceAzure(sources.DataSource):
             self._ephemeral_dhcp_ctx is None
             or self._ephemeral_dhcp_ctx.lease is None
         )
+
+    def _check_azure_proxy_agent_status(self) -> None:
+        """Check if azure-proxy-agent is ready for communication with WS/IMDS.
+
+        If ProvisionGuestProxyAgent is true, query azure-proxy-agent status,
+        waiting up to 120 seconds for the proxy to negotiate with Wireserver
+        and configure an eBPF proxy.  Once azure-proxy-agent is ready,
+        it will exit with code 0 and cloud-init can then expect to be able to
+        communicate with these services.
+
+        Fail deployment if azure-proxy-agent is not found or otherwise returns
+        an error.
+
+        For more information, check out:
+        https://github.com/azure/guestproxyagent
+        """
+        try:
+            cmd = [
+                "azure-proxy-agent",
+                "--status",
+                "--wait",
+                "120",
+            ]
+            out, err = subp.subp(cmd)
+            report_diagnostic_event(
+                "Executing %s resulted "
+                "in stderr=%r with stdout=%r" % (cmd, err, out),
+                logger_func=LOG.debug,
+            )
+        except subp.ProcessExecutionError as error:
+            if isinstance(error.reason, FileNotFoundError):
+                LOG.error(
+                    "Failed to activate Azure Guest Proxy Agent: "
+                    "azure-proxy-agent not found"
+                )
+                report_error = errors.ReportableErrorProxyAgentNotFound()
+                self._report_failure(report_error)
+            else:
+                report_diagnostic_event(
+                    "Failed to activate Azure Guest Proxy Agent: "
+                    "status check failed "
+                    "cmd=%r stderr=%r stdout=%r exit_code=%s"
+                    % (
+                        error.cmd,
+                        error.stderr,
+                        error.stdout,
+                        error.exit_code,
+                    ),
+                    logger_func=LOG.error,
+                )
+                reportable_error = (
+                    errors.ReportableErrorProxyAgentStatusFailure(error)
+                )
+                self._report_failure(reportable_error)
 
     @azure_ds_telemetry_reporter
     def crawl_metadata(self):
@@ -616,10 +664,6 @@ class DataSourceAzure(sources.DataSource):
                     "%s was not mountable" % src, logger_func=LOG.debug
                 )
                 continue
-            except BrokenAzureDataSource as exc:
-                msg = "BrokenAzureDataSource: %s" % exc
-                report_diagnostic_event(msg, logger_func=LOG.error)
-                raise sources.InvalidMetaDataException(msg)
         else:
             msg = (
                 "Unable to find provisioning media, falling back to IMDS "
@@ -642,6 +686,11 @@ class DataSourceAzure(sources.DataSource):
 
         imds_md = {}
         if self._is_ephemeral_networking_up():
+            # check if azure-proxy-agent is enabled in the ovf-env.xml file.
+            # azure-proxy-agent feature is opt-in and disabled by default.
+            if cfg.get("ProvisionGuestProxyAgent"):
+                self._check_azure_proxy_agent_status()
+
             imds_md = self.get_metadata_from_imds(report_failure=True)
 
         if not imds_md and ovf_source is None:
@@ -673,6 +722,9 @@ class DataSourceAzure(sources.DataSource):
                 self._wait_for_pps_unknown_reuse()
 
             md, userdata_raw, cfg, files = self._reprovision()
+            if cfg.get("ProvisionGuestProxyAgent"):
+                self._check_azure_proxy_agent_status()
+
             # fetch metadata again as it has changed after reprovisioning
             imds_md = self.get_metadata_from_imds(report_failure=True)
 
@@ -775,7 +827,7 @@ class DataSourceAzure(sources.DataSource):
 
     @azure_ds_telemetry_reporter
     def get_metadata_from_imds(self, report_failure: bool) -> Dict:
-        start_time = time()
+        start_time = monotonic()
         retry_deadline = start_time + 300
 
         # As a temporary workaround to support Azure Stack implementations
@@ -794,7 +846,7 @@ class DataSourceAzure(sources.DataSource):
             )
         except UrlError as error:
             error_string = str(error)
-            duration = time() - start_time
+            duration = monotonic() - start_time
             error_report = errors.ReportableErrorImdsUrlError(
                 exception=error, duration=duration
             )
@@ -857,11 +909,7 @@ class DataSourceAzure(sources.DataSource):
             LOG.warning("Failed to get system information: %s", e)
 
         try:
-            crawled_data = util.log_time(
-                logfunc=LOG.debug,
-                msg="Crawl of metadata service",
-                func=self.crawl_metadata,
-            )
+            crawled_data = self.crawl_metadata()
         except errors.ReportableError as error:
             self._report_failure(error)
             return False
@@ -992,7 +1040,7 @@ class DataSourceAzure(sources.DataSource):
         )
         system_uuid = identity.query_system_uuid()
         if os.path.exists(prev_iid_path):
-            previous = util.load_file(prev_iid_path).strip()
+            previous = util.load_text_file(prev_iid_path).strip()
             swapped_id = identity.byte_swap_system_uuid(system_uuid)
 
             # Older kernels than 4.15 will have UPPERCASE product_uuid.
@@ -1185,7 +1233,7 @@ class DataSourceAzure(sources.DataSource):
             logger_func=LOG.info,
         )
         sleep(31536000)
-        raise BrokenAzureDataSource("Shutdown failure for PPS disk.")
+        raise errors.ReportableErrorOsDiskPpsFailure()
 
     @azure_ds_telemetry_reporter
     def _wait_for_pps_running_reuse(self) -> None:
@@ -1262,7 +1310,7 @@ class DataSourceAzure(sources.DataSource):
     def _poll_imds(self) -> bytes:
         """Poll IMDs for reprovisiondata XML document data."""
         dhcp_attempts = 0
-        reprovision_data = None
+        reprovision_data: Optional[bytes] = None
         while not reprovision_data:
             if not self._is_ephemeral_networking_up():
                 dhcp_attempts += 1
@@ -1306,6 +1354,7 @@ class DataSourceAzure(sources.DataSource):
             f"Azure datasource failure occurred: {error.as_encoded_report()}",
             logger_func=LOG.error,
         )
+        report_dmesg_to_kvp()
         reported = kvp.report_failure_to_host(error)
         if host_only:
             return reported
@@ -1365,11 +1414,13 @@ class DataSourceAzure(sources.DataSource):
 
         :returns: List of SSH keys, if requested.
         """
+        report_dmesg_to_kvp()
         kvp.report_success_to_host()
 
         try:
             data = get_metadata_from_fabric(
                 endpoint=self._wireserver_endpoint,
+                distro=self.distro,
                 iso_dev=self._iso_dev,
                 pubkey_info=pubkey_info,
             )
@@ -1473,7 +1524,7 @@ class DataSourceAzure(sources.DataSource):
                 preserve_ntfs=self.ds_cfg.get(DS_CFG_KEY_PRESERVE_NTFS, False),
             )
         finally:
-            push_log_to_kvp(self.sys_cfg["def_log_file"])
+            report_dmesg_to_kvp()
         return
 
     @property
@@ -1682,15 +1733,18 @@ def can_dev_be_reformatted(devpath, preserve_ntfs):
     # devpath of /dev/sd[a-z] or /dev/disk/cloud/azure_resource
     # where partitions are "<devpath>1" or "<devpath>-part1" or "<devpath>p1"
     partitions = _partitions_on_device(devpath)
-    if len(partitions) == 0:
+    if not partitions:
         return False, "device %s was not partitioned" % devpath
-    elif len(partitions) > 2:
+
+    partition_len = len(partitions)
+    if partition_len > 2:
         msg = "device %s had 3 or more partitions: %s" % (
             devpath,
             " ".join([p[1] for p in partitions]),
         )
         return False, msg
-    elif len(partitions) == 2:
+
+    if partition_len == 2:
         cand_part, cand_path = partitions[1]
     else:
         cand_part, cand_path = partitions[0]
@@ -1805,7 +1859,7 @@ def write_files(datadir, files, dirmode=None):
     def _redact_password(cnt, fname):
         """Azure provides the UserPassword in plain text. So we redact it"""
         try:
-            root = ET.fromstring(cnt)
+            root = ET.fromstring(cnt)  # nosec B314
             for elem in root.iter():
                 if (
                     "UserPassword" in elem.tag
@@ -1822,7 +1876,7 @@ def write_files(datadir, files, dirmode=None):
     if not files:
         files = {}
     util.ensure_dir(datadir, dirmode)
-    for (name, content) in files.items():
+    for name, content in files.items():
         fname = os.path.join(datadir, name)
         if "ovf-env.xml" in name:
             content = _redact_password(content, fname)
@@ -1836,7 +1890,7 @@ def read_azure_ovf(contents):
     :return: Tuple of metadata, configuration, userdata dicts.
 
     :raises NonAzureDataSource: if XML is not in Azure's format.
-    :raises BrokenAzureDataSource: if XML is unparseable or invalid.
+    :raises errors.ReportableError: if XML is unparsable or invalid.
     """
     ovf_env = OvfEnvXml.parse_text(contents)
     md: Dict[str, Any] = {}
@@ -1876,6 +1930,12 @@ def read_azure_ovf(contents):
         "PreprovisionedVMType: %s" % ovf_env.preprovisioned_vm_type,
         logger_func=LOG.info,
     )
+
+    cfg["ProvisionGuestProxyAgent"] = ovf_env.provision_guest_proxy_agent
+    report_diagnostic_event(
+        "ProvisionGuestProxyAgent: %s" % ovf_env.provision_guest_proxy_agent,
+        logger_func=LOG.info,
+    )
     return (md, ud, cfg)
 
 
@@ -1903,12 +1963,12 @@ def _get_random_seed(source=PLATFORM_ENTROPY_SOURCE):
     # now update ds_cfg to reflect contents pass in config
     if source is None:
         return None
-    seed = util.load_file(source, quiet=True, decode=False)
+    seed = util.load_binary_file(source, quiet=True)
 
-    # The seed generally contains non-Unicode characters. load_file puts
+    # The seed generally contains non-Unicode characters. load_binary_file puts
     # them into bytes (in python 3).
-    # bytes is a non-serializable type, and the handler load_file
-    # uses applies b64 encoding *again* to handle it. The simplest solution
+    # bytes is a non-serializable type, and the handler
+    # used applies b64 encoding *again* to handle it. The simplest solution
     # is to just b64encode the data and then decode it to a serializable
     # string. Same number of bits of entropy, just with 25% more zeroes.
     # There's no need to undo this base64-encoding when the random seed is
@@ -1938,7 +1998,7 @@ def load_azure_ds_dir(source_dir):
     if not os.path.isfile(ovf_file):
         raise NonAzureDataSource("No ovf-env file found")
 
-    with open(ovf_file, "rb") as fp:
+    with performance.Timed("Reading ovf-env.xml"), open(ovf_file, "rb") as fp:
         contents = fp.read()
 
     md, ud, cfg = read_azure_ovf(contents)
@@ -1953,7 +2013,7 @@ def generate_network_config_from_instance_network_metadata(
 ) -> dict:
     """Convert imds network metadata dictionary to network v2 configuration.
 
-    :param: network_metadata: Dict of "network" key from instance metdata.
+    :param: network_metadata: Dict of "network" key from instance metadata.
 
     :return: Dictionary containing network version 2 standard configuration.
     """
@@ -1965,6 +2025,9 @@ def generate_network_config_from_instance_network_metadata(
         # addresses.
         nicname = "eth{idx}".format(idx=idx)
         dhcp_override = {"route-metric": (idx + 1) * 100}
+        # DNS resolution through secondary NICs is not supported, disable it.
+        if idx > 0:
+            dhcp_override["use-dns"] = False
         dev_config: Dict[str, Any] = {
             "dhcp4": True,
             "dhcp4-overrides": dhcp_override,

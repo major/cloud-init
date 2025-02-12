@@ -13,19 +13,25 @@ import uuid
 from pathlib import Path
 
 import pytest
+from pycloudlib.ec2.instance import EC2Instance
+from pycloudlib.gce.instance import GceInstance
 
 import cloudinit.config
-from cloudinit.features import get_features
+from cloudinit import lifecycle
 from cloudinit.util import is_true
 from tests.integration_tests.decorators import retry
 from tests.integration_tests.instances import IntegrationInstance
-from tests.integration_tests.integration_settings import PLATFORM
-from tests.integration_tests.releases import CURRENT_RELEASE, IS_UBUNTU
+from tests.integration_tests.integration_settings import (
+    OS_IMAGE_TYPE,
+    PLATFORM,
+)
+from tests.integration_tests.releases import CURRENT_RELEASE, IS_UBUNTU, JAMMY
 from tests.integration_tests.util import (
     get_feature_flag_value,
     get_inactive_modules,
     lxd_has_nocloud,
-    verify_clean_log,
+    network_wait_logged,
+    verify_clean_boot,
     verify_ordered_items_in_text,
 )
 
@@ -69,6 +75,7 @@ rsyslog:
     me: "127.0.0.1"
 runcmd:
   - echo 'hello world' > /var/tmp/runcmd_output
+  - echo '💩' > /var/tmp/unicode_data
 
   - #
   - logger "My test log"
@@ -90,6 +97,14 @@ class TestCombined:
         """
         Test that netplan config file is generated with proper permissions
         """
+        log = class_client.read_from_file("/var/log/cloud-init.log")
+        if CURRENT_RELEASE < JAMMY:
+            assert (
+                "No netplan python module. Fallback to write"
+                " /etc/netplan/50-cloud-init.yaml" in log
+            )
+        else:
+            assert "Rendered netplan config using netplan python API" in log
         file_perms = class_client.execute(
             "stat -c %a /etc/netplan/50-cloud-init.yaml"
         )
@@ -123,9 +138,28 @@ class TestCombined:
         """Check that deprecated key produces a log warning"""
         client = class_client
         log = client.read_from_file("/var/log/cloud-init.log")
-        assert "Deprecated cloud-config provided" in log
-        assert "The value of 'false' in user craig's 'sudo' config is " in log
-        assert 2 == log.count("DEPRECATE")
+        version_boundary = get_feature_flag_value(
+            class_client, "DEPRECATION_INFO_BOUNDARY"
+        )
+        deprecated_messages = ["users.1.sudo:  Changed in version 22.2."]
+        boundary_message = (
+            "The value of 'false' in user craig's 'sudo'"
+            " config is deprecated"
+        )
+        # the changed_version is 22.2 in schema for user.sudo key in
+        # user-data. Pass 22.2 in against the client's version_boundary.
+        if lifecycle.should_log_deprecation("22.2", version_boundary):
+            deprecated_messages.append(boundary_message)
+        else:
+            # Expect the distros deprecated call to be redacted.
+            # jsonschema still emits deprecation log due to changed_version
+            # instead of deprecated_version
+            assert f"[INFO]: {boundary_message}" in log
+        verify_clean_boot(
+            class_client,
+            require_deprecations=deprecated_messages,
+            ignore_warnings=True,
+        )
 
     def test_ntp_with_apt(self, class_client: IntegrationInstance):
         """LP #1628337.
@@ -151,14 +185,16 @@ class TestCombined:
         assert "LANG=en_GB.UTF-8" in default_locale
 
         locale_a = client.execute("locale -a")
-        verify_ordered_items_in_text(["en_GB.utf8", "en_US.utf8"], locale_a)
-
-        locale_gen = client.execute(
-            "cat /etc/locale.gen | grep -v '^#' | uniq"
-        )
-        verify_ordered_items_in_text(
-            ["en_GB.UTF-8", "en_US.UTF-8"], locale_gen
-        )
+        locale_gen = client.execute("grep -v '^#' /etc/locale.gen | uniq")
+        if OS_IMAGE_TYPE == "minimal":
+            # Minimal images don't have a en_US.utf8 locale
+            expected_locales = ["C.utf8", "en_GB.utf8"]
+            expected_locale_gen = ["en_GB.UTF-8", "UTF-8"]
+        else:
+            expected_locales = ["en_GB.utf8", "en_US.utf8"]
+            expected_locale_gen = ["en_GB.UTF-8", "en_US.UTF-8"]
+        verify_ordered_items_in_text(expected_locales, locale_a)
+        verify_ordered_items_in_text(expected_locale_gen, locale_gen)
 
     def test_random_seed_data(self, class_client: IntegrationInstance):
         """Integration test for the random seed module.
@@ -175,11 +211,11 @@ class TestCombined:
         assert result.startswith("MYUb34023nD:LFDK10913jk;dfnk:Df")
 
     def test_rsyslog(self, class_client: IntegrationInstance):
-        """Test rsyslog is configured correctly."""
-        client = class_client
-        assert "My test log" in client.read_from_file(
-            "/var/spool/rsyslog/cloudinit.log"
-        )
+        """Test rsyslog is configured correctly when applicable."""
+        if class_client.execute("command -v rsyslogd").ok:
+            assert "My test log" in class_client.read_from_file(
+                "/var/spool/rsyslog/cloudinit.log"
+            )
 
     def test_runcmd(self, class_client: IntegrationInstance):
         """Test runcmd works as expected"""
@@ -210,9 +246,7 @@ class TestCombined:
         assert timezone_output.strip() == "CET"
 
     def test_no_problems(self, class_client: IntegrationInstance):
-        """Test no errors, warnings, deprecations, tracebacks or
-        inactive modules.
-        """
+        """Test no errors, warnings, tracebacks or inactive modules."""
         client = class_client
         status_file = client.read_from_file("/run/cloud-init/status.json")
         status_json = json.loads(status_file)["v1"]
@@ -223,7 +257,19 @@ class TestCombined:
         assert result_json["errors"] == []
 
         log = client.read_from_file("/var/log/cloud-init.log")
-        verify_clean_log(log, ignore_deprecations=False)
+        require_warnings = []
+        if class_client.execute("command -v rsyslogd").failed:
+            # Some minimal images may not have an installed rsyslog package
+            # Test user-data doesn't provide install_rsyslog: true so expect
+            # warnings when not installed.
+            require_warnings.append(
+                "Failed to reload-or-try-restart rsyslog.service:"
+                " Unit rsyslog.service not found."
+            )
+        # Set ignore_deprecations=True as test_deprecated_message covers this
+        verify_clean_boot(
+            client, ignore_deprecations=True, require_warnings=require_warnings
+        )
         requested_modules = {
             "apt_configure",
             "byobu",
@@ -323,7 +369,13 @@ class TestCombined:
             "/run/cloud-init/combined-cloud-config.json"
         )
         data = json.loads(combined_json)
-        assert data["features"] == get_features()
+        expected_features = json.loads(
+            client.execute(
+                "python3 -c 'import json; from cloudinit import features; "
+                "print(json.dumps(features.get_features()))'"
+            )
+        )
+        assert data["features"] == expected_features
         assert data["system_info"]["default_user"]["name"] == "ubuntu"
 
     @pytest.mark.skipif(
@@ -447,6 +499,9 @@ class TestCombined:
             "/run/cloud-init/cloud-id-aws"
         )
         assert v1_data["subplatform"].startswith("metadata")
+
+        # type narrow since availability_zone is not a BaseInstance attribute
+        assert isinstance(client.instance, EC2Instance)
         assert (
             v1_data["availability_zone"] == client.instance.availability_zone
         )
@@ -469,8 +524,11 @@ class TestCombined:
             "/run/cloud-init/cloud-id-gce"
         )
         assert v1_data["subplatform"].startswith("metadata")
+        # type narrow since zone and instance_id are not BaseInstance
+        # attributes
+        assert isinstance(client.instance, GceInstance)
         assert v1_data["availability_zone"] == client.instance.zone
-        assert v1_data["instance_id"] == client.instance.instance_id
+        assert v1_data["instance_id"] == client.instance.id
         assert v1_data["local_hostname"] == client.instance.name
 
     @pytest.mark.skipif(
@@ -492,6 +550,17 @@ class TestCombined:
         client.restart()
         assert client.execute(f"test -f /run/cloud-init/{cloud_file}").ok
         assert client.execute("test -f /run/cloud-init/cloud-id").ok
+
+    def test_unicode(self, class_client: IntegrationInstance):
+        client = class_client
+        assert "💩" == client.read_from_file("/var/tmp/unicode_data")
+
+    @pytest.mark.skipif(not IS_UBUNTU, reason="Ubuntu-only behavior")
+    def test_networkd_wait_online(self, class_client: IntegrationInstance):
+        client = class_client
+        assert not network_wait_logged(
+            client.read_from_file("/var/log/cloud-init.log")
+        )
 
 
 @pytest.mark.user_data(USER_DATA)

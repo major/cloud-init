@@ -19,8 +19,10 @@ class TestGetFeatures:
             ALLOW_EC2_MIRRORS_ON_NON_AWS_INSTANCE_TYPES=True,
             EXPIRE_APPLIES_TO_HASHED_USERS=False,
             NETPLAN_CONFIG_ROOT_READ_ONLY=True,
+            DEPRECATION_INFO_BOUNDARY="devel",
             NOCLOUD_SEED_URL_APPEND_FORWARD_SLASH=False,
             APT_DEB822_SOURCE_LIST_FILE=True,
+            MANUAL_NETWORK_WAIT=False,
         ):
             assert {
                 "ERROR_ON_USER_DATA_FAILURE": True,
@@ -29,4 +31,6 @@ class TestGetFeatures:
                 "NETPLAN_CONFIG_ROOT_READ_ONLY": True,
                 "NOCLOUD_SEED_URL_APPEND_FORWARD_SLASH": False,
                 "APT_DEB822_SOURCE_LIST_FILE": True,
+                "DEPRECATION_INFO_BOUNDARY": "devel",
+                "MANUAL_NETWORK_WAIT": False,
             } == features.get_features()

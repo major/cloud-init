@@ -1,5 +1,6 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
+import re
 from unittest import mock
 
 import pytest
@@ -247,7 +248,7 @@ class TestHandle:
         """Test setting of correct debconf database entries"""
         m_is_efi_booted.return_value = is_uefi
         m_fetch_idevs.return_value = fetch_idevs_output
-        cfg = {"grub_dpkg": {}}
+        cfg = {"grub_dpkg": {"enabled": True}}
         if cfg_idevs is not None:
             cfg["grub_dpkg"]["grub-pc/install_devices"] = cfg_idevs
         if cfg_idevs_empty is not None:
@@ -299,10 +300,10 @@ class TestGrubDpkgSchema:
                 {"grub-dpkg": {"grub-pc/install_devices_empty": False}},
                 pytest.raises(
                     SchemaValidationError,
-                    match=(
-                        "Cloud config schema deprecations: grub-dpkg: An alias"
-                        " for ``grub_dpkg`` Deprecated in version 22.2. Use "
-                        "``grub_dpkg`` instead."
+                    match=re.escape(
+                        "Cloud config schema deprecations: grub-dpkg:"
+                        "  Deprecated in version 22.2. Use "
+                        "**grub_dpkg** instead."
                     ),
                 ),
                 False,
